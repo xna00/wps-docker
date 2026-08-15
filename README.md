@@ -1,36 +1,47 @@
 # pywpsrpc RPC 文档转 PDF 镜像（docx / pptx / xlsx / wps / et …）
 
-用 **WPS 11.1.0.9662 + pywpsrpc v2.4.0 原生 RPC** 将 Office/WPS/ODF 等格式文档转为 PDF 的 Docker 方案。
+用 **WPS 11.1.0.9662 + pywpsrpc v2.4.0 原生 RPC** 将 Office/WPS/ODF 等 **16 种格式**文档转为 PDF 的 Docker 方案。内置 20 个中文字体，支持 CLI 与 HTTP API 两种使用方式。
 
-## 背景（为什么需要这个组合）
+## 快速开始
 
-- WPS 11.1.0.11723+ 的 RPC server 不 LISTEN；**11.1.0.9662（2020 年）RPC server 正常**
-- 关于 WPS 12：官网 **12.1.2.28080 实测可用**——RPC SDK 库从 `librpc*_sysqt5.so` 改名 `librpc*_wpsqt.so`，需配套 pywpsrpc 2.4.0（见下文「WPS 12 备用镜像」）；早期社区"12 自动化接口失效"的说法与库名/版本不匹配有关
-- 9662 的客户端库是 `librpcwpsapi_sysqt5.so`（另含 `librpcwppapi_sysqt5.so` / `librpcetapi_sysqt5.so`），配套 **pywpsrpc v2.4.0**（2.4.0 的 `project.py` 按 `["wpsqt","sysqt5"]` 顺序探测，自动链接 9662 的 `_sysqt5`；本镜像已源码编译，wps/wpp/et 三模块全量编译）
-- 沙箱 seccomp 拦截 `mq_open(O_CREAT)`、无 UKUI 桌面 → 本镜像内置 LD_PRELOAD 修复库 `libmqsim2.so`（FIFO 模拟 mq）
-- 正常桌面 Linux + WPS 11.1.0.9662 上**无需**该修复库，版本匹配 + `-multiply` 即可
+### 方式一：CLI（一条命令转换）
 
-## 内置字体（中文字体来源）
+```bash
+# 输入/输出挂载到 /data，output.pdf 出现在当前目录
+docker run --rm -v "$PWD":/data wps2pdf input.docx output.pdf
 
-镜像内置 **20 个常用中文字体**（宋体/黑体/楷体/仿宋 + 方正系列 + Times New Roman），确保 WPS 转换时中文按公文字体规范渲染。
+# 不传参数时默认 /data/input.docx → /data/output.pdf
+docker run --rm -v "$PWD":/data wps2pdf
+```
 
-**来源仓库**：<https://github.com/DoveOutland/Common-Chinese-office-fonts-font-library->
+支持格式（按扩展名自动路由到 wps/wpp/et 三组件）：
 
-- 该仓库按《党政机关公文格式》（GB/T 9704-2012）收集常用中文字体，含中易（宋体/黑体/楷体/仿宋）、方正（大标宋/小标宋/仿宋/楷体/黑体）、长城（楷体_GB2312）等
-- **许可提醒**：部分字体仅供**非商业用途**，商用需自行联系字体厂商授权（详见该仓库 README）
-
-**打包方式**：20 个字体文件 `xz -9e` 打包为 `fonts.tar.xz`（约 57MB，解压后约 136MB），随仓库分发，构建时 `COPY` 进镜像解压到 `/usr/share/fonts/wps-office/`，无需联网下载。
-
-**字体清单**：
-
-| 类别 | 字体文件 |
+| 组件 | 格式 |
 |---|---|
-| 中易 | 宋体.ttc、黑体.ttf、楷体.ttf、仿宋.ttf |
-| 中易 GB2312 | 仿宋_GB2312.ttf、楷体_GB2312.ttf |
-| 方正 | 方正仿宋_GBK.ttf、方正仿宋简体.ttf、方正大标宋简体.ttf、方正大标宋简繁.ttf、方正小标宋_GBK.ttf、方正小标宋简体.ttf、方正楷体_GBK.ttf、方正楷体简体.ttf、方正黑体_GBK.ttf、方正黑体简体.ttf |
-| 西文 | Times New Roman/times.ttf、timesbd.ttf、timesbi.ttf、timesi.ttf |
+| 文字（wps） | docx doc wps rtf txt xml html htm mht mhtml odt uot uof dot dotx |
+| 演示（wpp） | pptx ppt dps pot potx odp uop pps ppsx |
+| 表格（et） | xlsx xls et csv ods uos xlt xltx ett prn dif |
 
-**如何更新字体**：上游仓库有更新时，重新下载字体 → `tar -cf - 字体目录 | xz -9e > fonts.tar.xz` → 替换本目录文件 → 提交即可。
+### 方式二：HTTP API（常驻服务）
+
+```bash
+# 启动（端口默认 8080）
+docker run -d --name wps-api -p 8080:8080 -e MODE=api wps2pdf
+
+# 健康检查
+curl http://localhost:8080/health
+#   {"status":"ok","wps":"ready"}
+
+# 上传文档 → 返回 PDF
+curl -o output.pdf -F "file=@input.docx" http://localhost:8080/convert
+
+# 可选环境变量
+#   PORT=8080       监听端口
+#   MAX_FILE_MB=50  上传大小上限（默认 50MB）
+```
+
+> 说明：服务懒初始化 WPS 实例，首次请求约 0.3s，之后**每个请求约 0.13s**（实测 10/10 成功、内存稳定，常驻单例 + 崩溃自动重建）。
+> **仅限内网使用，无鉴权**（如需公网暴露请自行加网关鉴权）。
 
 ## 构建
 
@@ -52,6 +63,17 @@ docker build -t wps2pdf .
 |---|---|---|
 | `WPS_DEB_URL` | 阿里云 ubuntukylin 完整 deb URL | WPS deb 下载地址。GitHub CI 会覆盖为仓库 Release 附件（自家 CDN 更快）；本地默认走阿里云 |
 | `FONTS_URL` | `github.com/.../releases/download/wps-11.1.0.9662/fonts.tar.xz` | 中文字体包（57MB）下载地址。CI 境外直连 GitHub CDN 秒级；**国内本地构建**建议覆盖为加速代理（实测 `https://ghfast.top/https://github.com/xna00/wps-docker/releases/download/wps-11.1.0.9662/fonts.tar.xz` 约 10s） |
+
+## 验证
+
+```bash
+pdfinfo output.pdf        # Creator 应为 "WPS 文字"，Pages 2
+pdftotext output.pdf -    # 中文内容完整
+
+# 端到端自动化测试（生成最小 docx → RPC 转换 → 断言 PDF 产物/页数）
+docker run --rm --entrypoint /bin/bash wps2pdf \
+  -c "/opt/wpsrpc-rpc/tests/e2e_test.sh"
+```
 
 ## WPS 12 备用镜像（Dockerfile.wps12）
 
@@ -85,53 +107,35 @@ docker build -f Dockerfile.wps12 -t wps2pdf-wps12 \
 
 > **注意**：12 为官网 Personal 版，商用需自行确认授权（与 9662 个人版同理）。
 
-## 使用
+## 背景（为什么需要这个组合）
 
-```bash
-# 基本用法：输入/输出挂载到 /data
-docker run --rm -v "$PWD":/data wps2pdf input.docx output.pdf
+- WPS 11.1.0.11723+ 的 RPC server 不 LISTEN；**11.1.0.9662（2020 年）RPC server 正常**
+- 关于 WPS 12：官网 **12.1.2.28080 实测可用**——RPC SDK 库从 `librpc*_sysqt5.so` 改名 `librpc*_wpsqt.so`，需配套 pywpsrpc 2.4.0（见上文「WPS 12 备用镜像」）；早期社区"12 自动化接口失效"的说法与库名/版本不匹配有关
+- 9662 的客户端库是 `librpcwpsapi_sysqt5.so`（另含 `librpcwppapi_sysqt5.so` / `librpcetapi_sysqt5.so`），配套 **pywpsrpc v2.4.0**（2.4.0 的 `project.py` 按 `["wpsqt","sysqt5"]` 顺序探测，自动链接 9662 的 `_sysqt5`；本镜像已源码编译，wps/wpp/et 三模块全量编译）
+- 沙箱 seccomp 拦截 `mq_open(O_CREAT)`、无 UKUI 桌面 → 本镜像内置 LD_PRELOAD 修复库 `libmqsim2.so`（FIFO 模拟 mq）
+- 正常桌面 Linux + WPS 11.1.0.9662 上**无需**该修复库，版本匹配 + `-multiply` 即可
 
-# 默认路径（不传参数）
-docker run --rm -v "$PWD":/data wps2pdf
-#   等价于: wps2pdf /data/input.docx /data/output.pdf
-```
+## 内置字体（中文字体来源）
 
-转换完成后，`output.pdf` 出现在挂载目录。
+镜像内置 **20 个常用中文字体**（宋体/黑体/楷体/仿宋 + 方正系列 + Times New Roman），确保 WPS 转换时中文按公文字体规范渲染。
 
-## HTTP 服务（API 模式）
+**来源仓库**：<https://github.com/DoveOutland/Common-Chinese-office-fonts-font-library->
 
-常驻 WPS 实例的 HTTP 转换服务，**仅限内网使用，无鉴权**（如需公网暴露请自行加网关鉴权）。
+- 该仓库按《党政机关公文格式》（GB/T 9704-2012）收集常用中文字体，含中易（宋体/黑体/楷体/仿宋）、方正（大标宋/小标宋/仿宋/楷体/黑体）、长城（楷体_GB2312）等
+- **许可提醒**：部分字体仅供**非商业用途**，商用需自行联系字体厂商授权（详见该仓库 README）
 
-```bash
-# 启动（端口默认 8080）
-docker run -d --name wps-api -p 8080:8080 \
-  -e MODE=api \
-  wps2pdf
+**打包方式**：20 个字体文件 `xz -9e` 打包为 `fonts.tar.xz`（约 57MB，解压后约 136MB），随仓库分发，构建时 `COPY` 进镜像解压到 `/usr/share/fonts/wps-office/`，无需联网下载。
 
-# 健康检查
-curl http://localhost:8080/health
-#   {"status":"ok","wps":"ready"}
+**字体清单**：
 
-# 上传 docx → 返回 PDF
-curl -o output.pdf -F "file=@input.docx" http://localhost:8080/convert
+| 类别 | 字体文件 |
+|---|---|
+| 中易 | 宋体.ttc、黑体.ttf、楷体.ttf、仿宋.ttf |
+| 中易 GB2312 | 仿宋_GB2312.ttf、楷体_GB2312.ttf |
+| 方正 | 方正仿宋_GBK.ttf、方正仿宋简体.ttf、方正大标宋简体.ttf、方正大标宋简繁.ttf、方正小标宋_GBK.ttf、方正小标宋简体.ttf、方正楷体_GBK.ttf、方正楷体简体.ttf、方正黑体_GBK.ttf、方正黑体简体.ttf |
+| 西文 | Times New Roman/times.ttf、timesbd.ttf、timesbi.ttf、timesi.ttf |
 
-# 可选环境变量
-#   PORT=8080       监听端口
-#   MAX_FILE_MB=50  上传大小上限（默认 50MB）
-```
-
-> 说明：服务启动时懒初始化 WPS 实例，首次请求约 0.3s，之后**每个请求约 0.13s**（实测 10/10 成功、内存稳定，常驻单例 + 崩溃自动重建）。
-
-## 验证
-
-```bash
-pdfinfo output.pdf        # Creator 应为 "WPS 文字"，Pages 2
-pdftotext output.pdf -    # 中文内容完整
-
-# 端到端自动化测试（生成最小 docx → RPC 转换 → 断言 PDF 产物/页数）
-docker run --rm --entrypoint /bin/bash wps2pdf \
-  -c "/opt/wpsrpc-rpc/tests/e2e_test.sh"
-```
+**如何更新字体**：上游仓库有更新时，重新下载字体 → `tar -cf - 字体目录 | xz -9e > fonts.tar.xz` → 替换本目录文件 → 提交即可。
 
 ## CI（GitHub Actions）
 
@@ -140,7 +144,7 @@ docker run --rm --entrypoint /bin/bash wps2pdf \
 1. **build job**：`docker/build-push-action` 构建镜像（WPS deb 走仓库 Release 附件 CDN，apt/pip 走阿里云），带 `type=gha` 构建缓存
 2. **test job**：`docker run --entrypoint /bin/bash ... e2e_test.sh` 在容器内真跑一次 docx→pdf 转换，断言 PDF 产物存在、>1KB、`%PDF-` 头、页数 ≥ 1
 
-> 首次运行约 5–10 分钟（WPS deb ~600MB 拉取 + 构建）；后续命中缓存会显著加快。
+> 仅镜像相关文件变化才触发构建（tag 发布/PR/手动触发无条件）；纯文档改动自动跳过。首次运行约 5–10 分钟（WPS deb ~600MB 拉取 + 构建）；后续命中缓存会显著加快。
 
 ## 目录结构
 
@@ -156,7 +160,7 @@ docker/
 ├── .github/workflows/    # GitHub Actions：build + test
 ├── pywpsrpc-2.4.0-src.tar.gz  # pywpsrpc v2.4.0 源码 + wpsrpc-sdk（2.2MB，主/备用镜像共用）
 ├── fonts.tar.xz          # 常用中文字体包（20 个字体，xz -9e，~57MB）
-├── libexitfix.c          # 修复库①：启动器 exit(1)→exit(0)（源码）
+├── libexitfix.c          # 修复库①：启动器 exit(1)→exit(0)（源码，2.4.0 不再 preload）
 ├── libmqsim.c            # 修复库②：FIFO 模拟 mq_open/mq_timedreceive（源码）
 └── pywpsrpc研究报告.md     # 完整逆向与修复链报告
 ```
