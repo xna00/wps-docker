@@ -35,7 +35,7 @@
 ## 构建
 
 ```bash
-docker build -t wps-docx2pdf .
+docker build -t wps2pdf .
 ```
 
 > 所有外部依赖统一走**阿里云镜像**（apt / pip / WPS deb），国内构建快，GitHub 境外 runner 实测同样可达，无需额外参数。
@@ -57,11 +57,11 @@ docker build -t wps-docx2pdf .
 
 ```bash
 # 基本用法：输入/输出挂载到 /data
-docker run --rm -v "$PWD":/data wps-docx2pdf input.docx output.pdf
+docker run --rm -v "$PWD":/data wps2pdf input.docx output.pdf
 
 # 默认路径（不传参数）
-docker run --rm -v "$PWD":/data wps-docx2pdf
-#   等价于: wps-docx2pdf /data/input.docx /data/output.pdf
+docker run --rm -v "$PWD":/data wps2pdf
+#   等价于: wps2pdf /data/input.docx /data/output.pdf
 ```
 
 转换完成后，`output.pdf` 出现在挂载目录。
@@ -74,7 +74,7 @@ docker run --rm -v "$PWD":/data wps-docx2pdf
 # 启动（端口默认 8080）
 docker run -d --name wps-api -p 8080:8080 \
   -e MODE=api \
-  wps-docx2pdf
+  wps2pdf
 
 # 健康检查
 curl http://localhost:8080/health
@@ -97,7 +97,7 @@ pdfinfo output.pdf        # Creator 应为 "WPS 文字"，Pages 2
 pdftotext output.pdf -    # 中文内容完整
 
 # 端到端自动化测试（生成最小 docx → RPC 转换 → 断言 PDF 产物/页数）
-docker run --rm --entrypoint /bin/bash wps-docx2pdf \
+docker run --rm --entrypoint /bin/bash wps2pdf \
   -c "/opt/wpsrpc-rpc/tests/e2e_test.sh"
 ```
 

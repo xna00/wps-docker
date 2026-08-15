@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE_NAME: wps-docx2pdf
+  IMAGE_NAME: wps2pdf
   # WPS deb 附件：GitHub Release 自家 CDN，境外 runner 下载比阿里云更快更稳
   WPS_DEB_URL: https://github.com/xna00/wps-docker/releases/download/wps-11.1.0.9662/wps-office_11.1.0.9662_amd64.deb
 

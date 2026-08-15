@@ -3,8 +3,8 @@
 # pywpsrpc RPC docx→pdf 转换镜像
 #   方案：WPS 11.1.0.9662（Qt4 时代，RPC server 正常）+
 #         pywpsrpc v1.1.0（源码编译，配套 librpcwpsapi_sysqt5.so）
-#   构建：docker build -t wps-docx2pdf .
-#   使用：docker run --rm -v $PWD:/data wps-docx2pdf input.docx output.pdf
+#   构建：docker build -t wps2pdf .
+#   使用：docker run --rm -v $PWD:/data wps2pdf input.docx output.pdf
 #   （输入/输出默认 /data/input.docx → /data/output.pdf）
 # ======================================================================
 
