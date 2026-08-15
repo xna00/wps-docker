@@ -399,3 +399,25 @@ docker/                      # 容器化交付方案（推荐）
 - 四版本对照表中 12.1.0.17900 / 12.1.2.28080 的 E_FAIL 均为**沙箱 seccomp 环境导致**；
   在 Docker（默认 seccomp 允许 mq_open）中 12.1.2.28080 完全可用
 - 官方论坛 #62639"自动化失效"与 **库名/版本匹配** 有关：新版 WPS 需配套新版 pywpsrpc（1.1.0→2.4.0）
+
+---
+
+## 🔥🔥🔥 主镜像升级：pywpsrpc 1.1.0 → 2.4.0（2026-08-15 三次更新）
+
+> 实测：**WPS 11.1.0.9662 + pywpsrpc 2.4.0 三组件转换全部通过**
+> （wps 966B / wpp 732B / et 15379B），且 **libexitfix 不再需要**（只 preload libmqsim2 依然 OK）。
+
+### 结论
+
+- **WPS 11 不可升级**：9662 是 11 系列唯一 RPC 正常版（更新的 11.1.0.11723 实测 RPC server 不监听）
+- **pywpsrpc 可单独升级到 2.4.0**：2.4.0 的 `_detect_rpc_lib` 按 `["wpsqt","sysqt5"]` 探测，
+  9662 的 office6 只有 `_sysqt5` → 自动降级链接（`ldd` 实测确认 `librpcwpsapi_sysqt5.so`）
+- **libexitfix 弃用**：启动感知修复在 pywpsrpc 2.4.0 客户端侧（与 WPS 版本无关），
+  9662 / 12 两个镜像的 entrypoint 均只 preload `libmqsim2.so`
+
+### 主镜像变更（v1.3.0）
+
+- Dockerfile builder：sip 5.5.0 + 三个 patch（py_versions / siplib.c / IKRpcClient.sip）→ **sip 6.8.3 + `sip-build`**（一条命令，无需 patch）
+- 源码包：`pywpsrpc-src.tar.gz`（1.1.0，11MB）→ `pywpsrpc-2.4.0-src.tar.gz`（2.2MB）
+- `entrypoint.sh` / `tests/e2e_test.sh`：`LD_PRELOAD` 只留 `libmqsim2.so`（`libexitfix.so` 保留文件备回退）
+- 其余（WPS 9662 安装、Office.conf、`-multiply`、gsettings、libtiff、字体）不变

@@ -2,14 +2,14 @@
 # ======================================================================
 # pywpsrpc RPC docx→pdf 转换镜像
 #   方案：WPS 11.1.0.9662（Qt4 时代，RPC server 正常）+
-#         pywpsrpc v1.1.0（源码编译，配套 librpcwpsapi_sysqt5.so）
+#         pywpsrpc v2.4.0（源码编译，自动探测并链接 librpcwpsapi_sysqt5.so）
 #   构建：docker build -t wps2pdf .
 #   使用：docker run --rm -v $PWD:/data wps2pdf input.docx output.pdf
 #   （输入/输出默认 /data/input.docx → /data/output.pdf）
 # ======================================================================
 
 # ----------------------------------------------------------------------
-# 阶段 1：编译 pywpsrpc v1.1.0 + 两个 LD_PRELOAD 修复库
+# 阶段 1：编译 pywpsrpc v2.4.0 + 两个 LD_PRELOAD 修复库
 # ----------------------------------------------------------------------
 FROM ubuntu:24.04 AS builder
 
@@ -30,25 +30,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # pip 用阿里云源（Ubuntu 24.04 PEP668 保护，用 --break-system-packages）
 RUN pip3 config set global.index-url https://mirrors.aliyun.com/pypi/simple/
 
-# sip 5.5.0（最后一个 sip5，官方只支持到 Py3.9，需 patch 支持 3.12）
-RUN pip3 install --no-cache-dir --break-system-packages sip==5.5.0
+# sip 6.8.3（pywpsrpc 2.4.0 兼容区间：sip 6.15+ 改 API 编译崩、sip 6.5.x 不支持 Py3.12 ABI）
+RUN pip3 install --no-cache-dir --break-system-packages sip==6.8.3
 
-# --- patch sip 5.5.0 支持 Python 3.12 ---
-RUN python3 - <<'PYEOF'
-import sipbuild, os
-p = os.path.join(os.path.dirname(sipbuild.__file__), 'py_versions.py')
-src = open(p).read()
-src = src.replace('LAST_SUPPORTED_MINOR = 9', 'LAST_SUPPORTED_MINOR = 12')
-open(p, 'w').write(src)
-print('patched:', p)
-PYEOF
+# --- pywpsrpc v2.4.0 源码（含 wpsrpc-sdk 头文件，打包自 timxx/pywpsrpc v2.4.0）---
+COPY pywpsrpc-2.4.0-src.tar.gz /tmp/
+RUN cd /tmp && tar xzf pywpsrpc-2.4.0-src.tar.gz && mv pywpsrpc-pack pywpsrpc-full
 
-# --- pywpsrpc v1.1.0 源码（含 wpsrpc-sdk）---
-COPY pywpsrpc-src.tar.gz /tmp/
-RUN cd /tmp && tar xzf pywpsrpc-src.tar.gz
-
-# --- WPS SDK 库：链接 pywpsrpc 需要 librpcwpsapi_sysqt5.so（仅提取，不完整安装）---
+# --- WPS SDK 库：librpcwpsapi_sysqt5.so（仅提取，不完整安装）---
 # 注：WPS deb 单文件 ~301MB，超过 GitHub 单文件 100MB 上限，不能 git commit 进仓库，只能远程拉取。
+# pywpsrpc 2.4.0 的 project.py 按 ["wpsqt","sysqt5"] 顺序探测，9662 的 office6 只有 _sysqt5 → 自动链接它
 RUN curl -fL --retry 5 --retry-delay 5 -C - -o /tmp/wps-sdk.deb \
         "${WPS_DEB_URL}" \
     && dpkg-deb -x /tmp/wps-sdk.deb /tmp/wps-x \
@@ -60,76 +51,20 @@ RUN curl -fL --retry 5 --retry-delay 5 -C - -o /tmp/wps-sdk.deb \
     && ls -la /opt/kingsoft/wps-office/office6/librpc*sysqt5.so \
     && rm -f /tmp/wps-sdk.deb && rm -rf /tmp/wps-x
 
-# --- 修复 IKRpcClient.sip 缺 #include <string>(gcc 严格模式不再传递包含, 导致 u16string 编译失败) ---
-RUN cd /tmp/pywpsrpc-full \
-    && sed -i 's|    #include <list>|    #include <list>\n    #include <string>|' \
-        sip/rpcwppapi/IKRpcClient.sip sip/rpcetapi/IKRpcClient.sip \
-    && grep -c "#include <string>" sip/rpcwppapi/IKRpcClient.sip sip/rpcetapi/IKRpcClient.sip
-
-# --- 生成 sip 项目（编译失败可忽略，产物用于后续 patch + 分模块编译）---
+# --- 编译 pywpsrpc v2.4.0（sip-build 一条命令；2.4.0 无需 sip5.5/siplib 的 Python 3.12 patch）---
 WORKDIR /tmp/pywpsrpc-full
-RUN cd /tmp/pywpsrpc-full \
-    && sip-build 2>&1 | tail -5 || true
+RUN sip-build 2>&1 | tail -5
 
-# --- patch siplib.c（Python 3.12 移除了公开的 _frame 结构）---
-RUN python3 - <<'PYEOF'
-p = '/tmp/pywpsrpc-full/build/sip/siplib.c'
-src = open(p).read()
-start = src.index('static struct _frame *sip_api_get_frame(int depth)')
-end = src.index('/*\n * Check if a type was generated using the given plugin.')
-new_fn = '''static struct _frame *sip_api_get_frame(int depth)
-{
-#if defined(PYPY_VERSION)
-    /* PyPy only supports a depth of 0. */
-    return NULL;
-#else
-    PyFrameObject *frame = PyEval_GetFrame();  /* borrowed */
-    Py_XINCREF(frame);
-
-    while (frame != NULL && depth > 0)
-    {
-        PyFrameObject *back = PyFrame_GetBack(frame);  /* new ref or NULL */
-        Py_DECREF(frame);
-        frame = back;
-        --depth;
-    }
-
-    return (struct _frame *)frame;
-#endif
-}
-
-
-'''
-src = src[:start] + new_fn + src[end:]
-open(p, 'w').write(src)
-print('siplib.c patched')
-PYEOF
-
-# --- 分模块编译：common / sip / rpcwpsapi / rpcwppapi / rpcetapi ---
-RUN cd /tmp/pywpsrpc-full/build/common && make -j$(nproc) 2>&1 | tail -2
-RUN cd /tmp/pywpsrpc-full/build/rpcwpsapi && make -j$(nproc) 2>&1 | grep -E "undefined reference|cannot find" | head -15
-RUN cd /tmp/pywpsrpc-full/build/sip && make -j$(nproc) 2>&1 | tail -2
-RUN cd /tmp/pywpsrpc-full/build/rpcwppapi && make -j$(nproc) 2>&1 | tail -2
-RUN cd /tmp/pywpsrpc-full/build/rpcetapi && make -j$(nproc) 2>&1 | tail -2
-RUN ls -la /tmp/pywpsrpc-full/build/sip/sip.so \
-        /tmp/pywpsrpc-full/build/common/common.so \
-        /tmp/pywpsrpc-full/build/rpcwpsapi/rpcwpsapi.so \
-        /tmp/pywpsrpc-full/build/rpcwppapi/rpcwppapi.so \
-        /tmp/pywpsrpc-full/build/rpcetapi/rpcetapi.so
-
-# --- 安装到 Python 3.12 的 dist-packages（从子目录产物拷贝）---
+# --- 安装到 Python 3.12 的 dist-packages ---
 RUN SP=$(python3 -c 'import site; print(site.getsitepackages()[0])') \
     && mkdir -p $SP/pywpsrpc \
-    && cp /tmp/pywpsrpc-full/py/__init__.py $SP/pywpsrpc/ \
-    && cp /tmp/pywpsrpc-full/py/utils.py $SP/pywpsrpc/ \
-    && cp /tmp/pywpsrpc-full/build/common/common.so $SP/pywpsrpc/ \
-    && cp /tmp/pywpsrpc-full/build/rpcwpsapi/rpcwpsapi.so $SP/pywpsrpc/ \
-    && cp /tmp/pywpsrpc-full/build/rpcwppapi/rpcwppapi.so $SP/pywpsrpc/ \
-    && cp /tmp/pywpsrpc-full/build/rpcetapi/rpcetapi.so $SP/pywpsrpc/ \
-    && cp /tmp/pywpsrpc-full/build/sip/sip.so $SP/pywpsrpc/ \
-    && ls -la $SP/pywpsrpc/
+    && cp -r build/pywpsrpc/* $SP/pywpsrpc/ \
+    && ls -la $SP/pywpsrpc/ \
+    && ldd $SP/pywpsrpc/rpcwpsapi.so | grep librpc
 
 # --- 编译两个 LD_PRELOAD 修复库 ---
+# 注：libexitfix 是 pywpsrpc 1.1.0 时代的启动器退出码补丁，2.4.0 已不需要（实测 9662/12 均无需），
+#     仅保留文件便于回退验证；entrypoint 实际只 preload libmqsim2.so。
 COPY libexitfix.c libmqsim.c /tmp/
 RUN gcc -shared -fPIC -O2 -o /tmp/libexitfix.so /tmp/libexitfix.c \
     && gcc -shared -fPIC -O2 -o /tmp/libmqsim2.so /tmp/libmqsim.c -lrt \

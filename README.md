@@ -1,14 +1,14 @@
 # pywpsrpc RPC 文档转 PDF 镜像（docx / pptx / xlsx / wps / et …）
 
-用 **WPS 11.1.0.9662 + pywpsrpc v1.1.0 原生 RPC** 将 Office/WPS/ODF 等格式文档转为 PDF 的 Docker 方案。
+用 **WPS 11.1.0.9662 + pywpsrpc v2.4.0 原生 RPC** 将 Office/WPS/ODF 等格式文档转为 PDF 的 Docker 方案。
 
 ## 背景（为什么需要这个组合）
 
 - WPS 11.1.0.11723+ 的 RPC server 不 LISTEN；**11.1.0.9662（2020 年）RPC server 正常**
 - 关于 WPS 12：官网 **12.1.2.28080 实测可用**——RPC SDK 库从 `librpc*_sysqt5.so` 改名 `librpc*_wpsqt.so`，需配套 pywpsrpc 2.4.0（见下文「WPS 12 备用镜像」）；早期社区"12 自动化接口失效"的说法与库名/版本不匹配有关
-- 9662 的客户端库是 `librpcwpsapi_sysqt5.so`（另含 `librpcwppapi_sysqt5.so` / `librpcetapi_sysqt5.so`），需配套 **pywpsrpc v1.1.0**（本镜像已源码编译，wps/wpp/et 三模块全量编译）
-- 沙箱 seccomp 拦截 `mq_open(O_CREAT)`、无 UKUI 桌面 → 本镜像内置两个 LD_PRELOAD 修复库
-- 正常桌面 Linux + WPS 11.1.0.9662 上**无需**这两个修复库，版本匹配 + `-multiply` 即可
+- 9662 的客户端库是 `librpcwpsapi_sysqt5.so`（另含 `librpcwppapi_sysqt5.so` / `librpcetapi_sysqt5.so`），配套 **pywpsrpc v2.4.0**（2.4.0 的 `project.py` 按 `["wpsqt","sysqt5"]` 顺序探测，自动链接 9662 的 `_sysqt5`；本镜像已源码编译，wps/wpp/et 三模块全量编译）
+- 沙箱 seccomp 拦截 `mq_open(O_CREAT)`、无 UKUI 桌面 → 本镜像内置 LD_PRELOAD 修复库 `libmqsim2.so`（FIFO 模拟 mq）
+- 正常桌面 Linux + WPS 11.1.0.9662 上**无需**该修复库，版本匹配 + `-multiply` 即可
 
 ## 内置字体（中文字体来源）
 
@@ -55,7 +55,7 @@ docker build -t wps2pdf .
 
 ## WPS 12 备用镜像（Dockerfile.wps12）
 
-主镜像（9662 + pywpsrpc 1.1.0）稳定运行中；`Dockerfile.wps12` 提供 **WPS 12.1.2.28080 + pywpsrpc 2.4.0** 的备用构建路径，用于：
+主镜像（9662 + pywpsrpc 2.4.0）稳定运行中；`Dockerfile.wps12` 提供 **WPS 12.1.2.28080 + pywpsrpc 2.4.0** 的备用构建路径，用于：
 - 9662 的 deb 源（阿里云 ubuntukylin）失效导致主镜像无法构建时
 - 新版文档（Office 365 等）在 9662 下渲染异常、需要新版解析内核时
 
@@ -65,7 +65,7 @@ docker build -t wps2pdf .
 |---|---|---|
 | WPS | 11.1.0.9662（301MB deb，固定 URL） | 12.1.2.28080（571MB deb，官网动态签名下载） |
 | RPC SDK 库 | `librpc*_sysqt5.so` | `librpc*_wpsqt.so`（12 改名） |
-| pywpsrpc | v1.1.0（sip 5.5.0 + patch） | v2.4.0（sip 6.8.3 + `sip-build`，自动探测 `_wpsqt`） |
+| pywpsrpc | v2.4.0（sip 6.8.3 + `sip-build`，自动探测 `_sysqt5`） | v2.4.0（sip 6.8.3 + `sip-build`，自动探测 `_wpsqt`） |
 | 镜像体积 | ~2.1GB | ~3.1GB |
 
 构建：
@@ -81,7 +81,7 @@ docker build -f Dockerfile.wps12 -t wps2pdf-wps12 \
 
 已验证：三组件（wps/wpp/et）RPC 驱动 + 新建→转 PDF 全部通过；共享 `entrypoint.sh`/`http_server.py`/`convert_docx2pdf.py`，API 与主镜像完全兼容。
 
-**修复库说明**：`libmqsim2.so`（seccomp 拦 `mq_open` 的环境修复）对 12 **同样必需**（其 RPC 握手同样走 POSIX 消息队列）；`libexitfix.so`（1.1.0 的启动器退出码补丁）对 pywpsrpc 2.4.0 **已非必需**（实测去掉仍可三组件转换），因 `entrypoint.sh` 与主镜像共享而保留，无副作用。
+**修复库说明**：`libmqsim2.so`（seccomp 拦 `mq_open` 的环境修复）对 12 **同样必需**（其 RPC 握手同样走 POSIX 消息队列）；`libexitfix.so`（1.1.0 的启动器退出码补丁）对 pywpsrpc 2.4.0 **已非必需**（实测去掉仍可三组件转换），两个镜像的 entrypoint 均只 preload `libmqsim2.so`，`libexitfix.so` 仅保留文件便于回退验证。
 
 > **注意**：12 为官网 Personal 版，商用需自行确认授权（与 9662 个人版同理）。
 
@@ -154,8 +154,7 @@ docker/
 ├── http_server.py        # HTTP 服务（MODE=api：POST /convert → PDF）
 ├── tests/e2e_test.sh     # 端到端测试（CI test job 使用）
 ├── .github/workflows/    # GitHub Actions：build + test
-├── pywpsrpc-src.tar.gz   # pywpsrpc v1.1.0 源码 + wpsrpc-sdk（11MB）
-├── pywpsrpc-2.4.0-src.tar.gz  # pywpsrpc v2.4.0 源码 + wpsrpc-sdk（2.2MB，WPS 12 备用镜像用）
+├── pywpsrpc-2.4.0-src.tar.gz  # pywpsrpc v2.4.0 源码 + wpsrpc-sdk（2.2MB，主/备用镜像共用）
 ├── fonts.tar.xz          # 常用中文字体包（20 个字体，xz -9e，~57MB）
 ├── libexitfix.c          # 修复库①：启动器 exit(1)→exit(0)（源码）
 ├── libmqsim.c            # 修复库②：FIFO 模拟 mq_open/mq_timedreceive（源码）
@@ -166,14 +165,14 @@ docker/
 
 | 项目 | 说明 |
 |---|---|
-| WPS 9662 | RPC server 正常激活的版本（12.x 自动化接口失效） |
-| pywpsrpc v1.1.0 | 配套 `librpcwpsapi_sysqt5.so`；sip 5.5.0 已 patch 支持 Py3.12，siplib.c 已改用 `PyFrame_GetBack` |
+| WPS 9662 | RPC server 正常激活的版本（更新的 11.1.0.11723 实测 RPC server 不监听） |
+| pywpsrpc v2.4.0 | 配套 `librpcwpsapi_sysqt5.so`（project.py 自动探测）；sip 6.8.3 + `sip-build` 编译，无需 sip5.5/siplib patch |
 | `-multiply` | `/usr/bin/wps` 脚本取消注释 `gOptExt=-multiply`（多组件 RPC 激活） |
 | wps 脚本 exec | 默认分支改 `exec` 直接启动（避免 bash 中间层退出误判） |
 | 假 gsettings | SDK 的 tablet-mode 探测需成功返回（`/usr/local/bin/gsettings`） |
-| libexitfix.so | 启动器进程 `exit(1)→exit(0)`（客户端将非 0 退出码判为失败） |
+| libexitfix.so | 启动器进程 `exit(1)→exit(0)`（1.1.0 时代的补丁；2.4.0 实测不需要，仅保留文件备回退） |
 | libmqsim.so | 容器 seccomp 拦截 `mq_open(O_CREAT)` → 用 FIFO+poll 模拟全套 mq 接口 |
 | setStartTimeout | 单位是**微秒**：`15000000` = 15s |
-| API 命名 | v1.1.0 用 `get_Documents()` / `get_ActiveDocument()` |
+| API 命名 | pywpsrpc 用 `get_Documents()` / `get_ActiveDocument()`（1.1.0/2.4.0 一致） |
 | DBUS 地址 | 转换脚本用 `setdefault` 沿用 entrypoint 里 `dbus-launch` 注入的真实会话地址，不硬编码覆盖 |
 | main 入口 | 脚本末尾必须有 `if __name__ == "__main__": main()`；缺失时 `main()` 不执行、Python 退出清理 Qt 直接段错误 |

@@ -41,7 +41,10 @@ sleep 1
 
 # --- 环境修复（沙箱 seccomp / 无桌面环境的针对性修复）---
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-export LD_PRELOAD="/opt/wpsrpc-fix/libexitfix.so:/opt/wpsrpc-fix/libmqsim2.so"
+# 只 preload libmqsim2（seccomp 拦 mq_open 的环境修复）
+# 注：libexitfix（1.1.0 的启动器退出码补丁）在 pywpsrpc 2.4.0 下已不需要（实测 9662/12 均无需），
+#     镜像内仍保留该文件便于回退验证，但不再 preload。
+export LD_PRELOAD="/opt/wpsrpc-fix/libmqsim2.so"
 
 if [ "$MODE" = "api" ]; then
     echo "== pywpsrpc HTTP 服务启动 =="

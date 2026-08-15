@@ -23,7 +23,8 @@ sleep 2
 fluxbox >/tmp/fluxbox.log 2>&1 &
 sleep 1
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-export LD_PRELOAD="/opt/wpsrpc-fix/libexitfix.so:/opt/wpsrpc-fix/libmqsim2.so"
+# 只 preload libmqsim2（seccomp 拦 mq_open 的环境修复）；libexitfix 在 pywpsrpc 2.4.0 下已不需要
+export LD_PRELOAD="/opt/wpsrpc-fix/libmqsim2.so"
 
 echo "== [1/4] 生成最小英文测试 docx =="
 # 用 LibreOffice 兼容的极简 OOXML 构造一个最小 docx（纯英文，避免依赖中文字体）
