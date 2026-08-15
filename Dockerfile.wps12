@@ -84,8 +84,10 @@ RUN gcc -shared -fPIC -O2 -o /tmp/libexitfix.so /tmp/libexitfix.c \
 FROM ubuntu:24.04
 
 ARG WPS_DEB_URL=""
-# 中文字体包（复用主镜像的 Release 附件；ghfast.top 前缀是 GitHub 加速代理，国内/受限网络可用）
-ARG FONTS_URL="https://ghfast.top/https://github.com/xna00/wps-docker/releases/download/wps-11.1.0.9662/fonts.tar.xz"
+# 中文字体包（复用主镜像 Release 附件，GitHub 自家 CDN）
+# 国内/受限网络可 --build-arg 覆盖为 ghfast.top 加速：
+#   https://ghfast.top/https://github.com/xna00/wps-docker/releases/download/wps-11.1.0.9662/fonts.tar.xz
+ARG FONTS_URL="https://github.com/xna00/wps-docker/releases/download/wps-11.1.0.9662/fonts.tar.xz"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
