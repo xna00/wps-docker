@@ -14,3 +14,6 @@ core.*
 # zip 包（仓库已含源码，打包产物不纳入版本控制）
 *.zip
 fonts.tar.xz
+
+# WPS deb（>100MB 单文件限制，不能进 git，走 GitHub Release 附件）
+*.deb

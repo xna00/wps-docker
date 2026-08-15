@@ -4,8 +4,8 @@
 
 ## 背景（为什么需要这个组合）
 
-- WPS 12.1.0.225xx 之后 Linux 自动化接口（COM/RPC）普遍失效（官方论坛 bbs.wps.cn/topic/62639 佐证）
 - WPS 11.1.0.11723+ 的 RPC server 不 LISTEN；**11.1.0.9662（2020 年）RPC server 正常**
+- 关于 WPS 12：官网 **12.1.2.28080 实测可用**——RPC SDK 库从 `librpc*_sysqt5.so` 改名 `librpc*_wpsqt.so`，需配套 pywpsrpc 2.4.0（见下文「WPS 12 备用镜像」）；早期社区"12 自动化接口失效"的说法与库名/版本不匹配有关
 - 9662 的客户端库是 `librpcwpsapi_sysqt5.so`（另含 `librpcwppapi_sysqt5.so` / `librpcetapi_sysqt5.so`），需配套 **pywpsrpc v1.1.0**（本镜像已源码编译，wps/wpp/et 三模块全量编译）
 - 沙箱 seccomp 拦截 `mq_open(O_CREAT)`、无 UKUI 桌面 → 本镜像内置两个 LD_PRELOAD 修复库
 - 正常桌面 Linux + WPS 11.1.0.9662 上**无需**这两个修复库，版本匹配 + `-multiply` 即可
@@ -52,6 +52,36 @@ docker build -t wps2pdf .
 |---|---|---|
 | `WPS_DEB_URL` | 阿里云 ubuntukylin 完整 deb URL | WPS deb 下载地址。GitHub CI 会覆盖为仓库 Release 附件（自家 CDN 更快）；本地默认走阿里云 |
 | `FONTS_URL` | `github.com/.../releases/download/wps-11.1.0.9662/fonts.tar.xz` | 中文字体包（57MB）下载地址。CI 境外直连 GitHub CDN 秒级；**国内本地构建**建议覆盖为加速代理（实测 `https://ghfast.top/https://github.com/xna00/wps-docker/releases/download/wps-11.1.0.9662/fonts.tar.xz` 约 10s） |
+
+## WPS 12 备用镜像（Dockerfile.wps12）
+
+主镜像（9662 + pywpsrpc 1.1.0）稳定运行中；`Dockerfile.wps12` 提供 **WPS 12.1.2.28080 + pywpsrpc 2.4.0** 的备用构建路径，用于：
+- 9662 的 deb 源（阿里云 ubuntukylin）失效导致主镜像无法构建时
+- 新版文档（Office 365 等）在 9662 下渲染异常、需要新版解析内核时
+
+**与主镜像的差异**：
+
+| 项 | 主镜像（Dockerfile） | 备用镜像（Dockerfile.wps12） |
+|---|---|---|
+| WPS | 11.1.0.9662（301MB deb，固定 URL） | 12.1.2.28080（571MB deb，官网动态签名下载） |
+| RPC SDK 库 | `librpc*_sysqt5.so` | `librpc*_wpsqt.so`（12 改名） |
+| pywpsrpc | v1.1.0（sip 5.5.0 + patch） | v2.4.0（sip 6.8.3 + `sip-build`，自动探测 `_wpsqt`） |
+| 镜像体积 | ~2.1GB | ~3.1GB |
+
+构建：
+
+```bash
+# 默认：download_wps12.sh 从官网 wpscdn 动态签名下载（需外网）
+docker build -f Dockerfile.wps12 -t wps2pdf-wps12 .
+
+# 或指定 Release 附件 URL（GitHub 自家 CDN，更稳）
+docker build -f Dockerfile.wps12 -t wps2pdf-wps12 \
+  --build-arg WPS_DEB_URL=https://github.com/<owner>/<repo>/releases/download/<tag>/wps-office_12.1.2.28080.AK.preread.sw.Personal_765474_amd64.deb .
+```
+
+已验证：三组件（wps/wpp/et）RPC 驱动 + 新建→转 PDF 全部通过；共享 `entrypoint.sh`/`http_server.py`/`convert_docx2pdf.py`，API 与主镜像完全兼容。
+
+> **注意**：12 为官网 Personal 版，商用需自行确认授权（与 9662 个人版同理）。
 
 ## 使用
 
@@ -115,12 +145,15 @@ docker run --rm --entrypoint /bin/bash wps2pdf \
 ```
 docker/
 ├── Dockerfile            # 两阶段构建（builder 编译 pywpsrpc + 修复库）
+├── Dockerfile.wps12      # WPS 12 备用镜像（12.1.2.28080 + pywpsrpc 2.4.0）
+├── download_wps12.sh     # WPS 12 deb 官网动态签名下载脚本
 ├── entrypoint.sh         # 容器入口：Xvfb + dbus + fluxbox + 转换
 ├── convert_docx2pdf.py   # RPC 转换脚本（getWpsApplication → Open → SaveAs2 PDF）
 ├── http_server.py        # HTTP 服务（MODE=api：POST /convert → PDF）
 ├── tests/e2e_test.sh     # 端到端测试（CI test job 使用）
 ├── .github/workflows/    # GitHub Actions：build + test
 ├── pywpsrpc-src.tar.gz   # pywpsrpc v1.1.0 源码 + wpsrpc-sdk（11MB）
+├── pywpsrpc-2.4.0-src.tar.gz  # pywpsrpc v2.4.0 源码 + wpsrpc-sdk（2.2MB，WPS 12 备用镜像用）
 ├── fonts.tar.xz          # 常用中文字体包（20 个字体，xz -9e，~57MB）
 ├── libexitfix.c          # 修复库①：启动器 exit(1)→exit(0)（源码）
 ├── libmqsim.c            # 修复库②：FIFO 模拟 mq_open/mq_timedreceive（源码）
