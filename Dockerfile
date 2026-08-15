@@ -48,9 +48,9 @@ COPY pywpsrpc-src.tar.gz /tmp/
 RUN cd /tmp && tar xzf pywpsrpc-src.tar.gz
 
 # --- WPS SDK 库：链接 pywpsrpc 需要 librpcwpsapi_sysqt5.so（仅提取，不完整安装）---
-# WPS deb 默认走 ubuntukylin 镜像；国内/内网构建可覆盖 WPS_DEB_BASE 指向阿里云等镜像。
+# WPS deb 默认走阿里云 ubuntukylin 镜像（已验证 200）；可用 --build-arg WPS_DEB_BASE 覆盖为其他镜像。
 # 注：WPS deb 单文件 ~301MB，超过 GitHub 单文件 100MB 上限，不能 git commit 进仓库，只能远程拉取。
-ARG WPS_DEB_BASE="https://mirrors.ustc.edu.cn/ubuntukylin/pool/partner"
+ARG WPS_DEB_BASE="https://mirrors.aliyun.com/ubuntukylin/pool/partner"
 RUN curl -fL --retry 5 --retry-delay 5 -C - -o /tmp/wps-sdk.deb \
         "${WPS_DEB_BASE}/wps-office_11.1.0.9662_amd64.deb" \
     && dpkg-deb -x /tmp/wps-sdk.deb /tmp/wps-x \
@@ -129,7 +129,7 @@ FROM ubuntu:24.04
 
 # runtime 阶段需重新声明 ARG（每个 FROM 都会重置构建参数作用域）
 ARG APT_MIRROR_BASE="http://archive.ubuntu.com/ubuntu"
-ARG WPS_DEB_BASE="https://mirrors.ustc.edu.cn/ubuntukylin/pool/partner"
+ARG WPS_DEB_BASE="https://mirrors.aliyun.com/ubuntukylin/pool/partner"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -151,8 +151,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         poppler-utils python3 ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-# --- WPS Office 11.1.0.9662（ubuntukylin 社区仓库，单文件 ~301MB）---
-# 默认走 ustc 镜像（境外可达）；国内/内网构建传 --build-arg WPS_DEB_BASE=https://mirrors.aliyun.com/ubuntukylin/pool/partner
+# --- WPS Office 11.1.0.9662（阿里云 ubuntukylin 社区仓库，单文件 ~301MB）---
+# 默认走阿里云（已验证 200）；可用 --build-arg WPS_DEB_BASE 覆盖为其他镜像。
 # 若镜像 URL 失效，可手动下载 wps-office_11.1.0.9662_amd64.deb 放到构建目录，
 # 并改用: COPY wps-office_11.1.0.9662_amd64.deb /tmp/wps.deb
 RUN curl -fL --retry 5 --retry-delay 5 -C - -o /tmp/wps.deb \

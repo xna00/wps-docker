@@ -30,7 +30,7 @@ docker build -t wps-docx2pdf \
 |---|---|---|
 | `APT_MIRROR_BASE` | `http://archive.ubuntu.com/ubuntu`（官方） | apt 源；国内可传 `http://mirrors.aliyun.com/ubuntu` |
 | `PIP_INDEX` | `https://pypi.org/simple`（官方） | pip 索引源；国内可传 `https://mirrors.aliyun.com/pypi/simple/` |
-| `WPS_DEB_BASE` | `https://mirrors.ustc.edu.cn/ubuntukylin/pool/partner` | WPS deb 下载镜像目录；国内可传 `https://mirrors.aliyun.com/ubuntukylin/pool/partner` |
+| `WPS_DEB_BASE` | `https://mirrors.aliyun.com/ubuntukylin/pool/partner` | WPS deb 下载镜像目录（已验证 200）；如需覆盖可传其他镜像基址 |
 
 > 说明：
 > - WPS deb 单文件约 301MB，超过 GitHub 单文件 100MB 上限，**不能 git commit 进仓库**，只能从镜像远程拉取。
