@@ -19,6 +19,14 @@ export DISPLAY=:99
 export XDG_RUNTIME_DIR=/tmp/runtime-root
 mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
 
+# --- 清理上次运行的残留（容器 stop/start 场景，SIGKILL 不会自动清理）---
+# 1) Xvfb 锁：残留会导致 Xvfb :99 启动失败 → WPS 无显示 → getApplication E_FAIL
+rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
+# 2) RPC socket 残留：影响新 RPC 握手
+rm -rf /root/.local/share/Kingsoft/daemon && mkdir -p /root/.local/share/Kingsoft/daemon
+# 3) WPS 崩溃重启记录（RestartAppInfo）：残留会导致"幽灵 WPS 实例"用历史参数重启
+sed -i '/RestartAppInfo=/d' /root/.config/Kingsoft/Office.conf 2>/dev/null || true
+
 # dbus session bus
 eval "$(dbus-launch --sh-syntax)"
 
