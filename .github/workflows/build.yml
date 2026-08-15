@@ -19,9 +19,45 @@ env:
 
 jobs:
   # ------------------------------------------------------------------
+  # 0) 文件变更过滤：仅镜像相关文件变化才跑构建
+  #    tag 发布 / PR / 手动触发 直接放行；push main 按 paths-filter 判断
+  # ------------------------------------------------------------------
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.filter.outputs.image }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            image:
+              - 'Dockerfile'
+              - 'Dockerfile.wps12'
+              - 'entrypoint.sh'
+              - 'convert_docx2pdf.py'
+              - 'http_server.py'
+              - 'libexitfix.c'
+              - 'libmqsim.c'
+              - 'download_wps12.sh'
+              - 'pywpsrpc-src.tar.gz'
+              - 'pywpsrpc-2.4.0-src.tar.gz'
+              - 'fonts.tar.xz'
+              - 'tests/**'
+              - '.github/workflows/**'
+              - '.dockerignore'
+
+  # ------------------------------------------------------------------
   # 1) 构建镜像（WPS deb 走 GitHub Release，apt/pip 走阿里云，适配境外 runner）
   # ------------------------------------------------------------------
   build:
+    needs: changes
+    # tag 发布 / PR / 手动触发 直接放行；push main 仅镜像相关文件变化才构建
+    if: |
+      startsWith(github.ref, 'refs/tags/') ||
+      github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch' ||
+      needs.changes.outputs.image == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:

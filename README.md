@@ -81,6 +81,8 @@ docker build -f Dockerfile.wps12 -t wps2pdf-wps12 \
 
 已验证：三组件（wps/wpp/et）RPC 驱动 + 新建→转 PDF 全部通过；共享 `entrypoint.sh`/`http_server.py`/`convert_docx2pdf.py`，API 与主镜像完全兼容。
 
+**修复库说明**：`libmqsim2.so`（seccomp 拦 `mq_open` 的环境修复）对 12 **同样必需**（其 RPC 握手同样走 POSIX 消息队列）；`libexitfix.so`（1.1.0 的启动器退出码补丁）对 pywpsrpc 2.4.0 **已非必需**（实测去掉仍可三组件转换），因 `entrypoint.sh` 与主镜像共享而保留，无副作用。
+
 > **注意**：12 为官网 Personal 版，商用需自行确认授权（与 9662 个人版同理）。
 
 ## 使用
