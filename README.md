@@ -13,13 +13,32 @@
 ## 构建
 
 ```bash
-cd docker
+# 境外/GitHub Actions（默认：官方 apt 源 + USTC 镜像拉 WPS deb）
 docker build -t wps-docx2pdf .
+
+# 国内/内网（阿里云镜像源，构建更快更稳）
+docker build -t wps-docx2pdf \
+  --build-arg APT_MIRROR_BASE="http://mirrors.aliyun.com/ubuntu" \
+  --build-arg PIP_INDEX="https://mirrors.aliyun.com/pypi/simple/" \
+  --build-arg WPS_DEB_BASE="https://mirrors.aliyun.com/ubuntukylin/pool/partner" \
+  .
 ```
 
-> 构建时会从阿里云镜像下载 301MB 的 WPS deb（URL 失效可手动下载
-> `wps-office_11.1.0.9662_amd64.deb` 放本目录，把 Dockerfile 中 `ADD https://...` 改为
-> `COPY wps-office_11.1.0.9662_amd64.deb /tmp/wps.deb`）。
+### 构建参数（build-arg）
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `APT_MIRROR_BASE` | `http://archive.ubuntu.com/ubuntu`（官方） | apt 源；国内可传 `http://mirrors.aliyun.com/ubuntu` |
+| `PIP_INDEX` | `https://pypi.org/simple`（官方） | pip 索引源；国内可传 `https://mirrors.aliyun.com/pypi/simple/` |
+| `WPS_DEB_BASE` | `https://mirrors.ustc.edu.cn/ubuntukylin/pool/partner` | WPS deb 下载镜像目录；国内可传 `https://mirrors.aliyun.com/ubuntukylin/pool/partner` |
+
+> 说明：
+> - WPS deb 单文件约 301MB，超过 GitHub 单文件 100MB 上限，**不能 git commit 进仓库**，只能从镜像远程拉取。
+> - 拉取用 `curl -fL --retry 5` 带重试，网络不稳定时不易失败。
+> - 若镜像 URL 全部失效，可手动下载 `wps-office_11.1.0.9662_amd64.deb` 放本目录，
+>   把 Dockerfile 中对应两处 `curl ... "${WPS_DEB_BASE}/..."` 改为
+>   `COPY wps-office_11.1.0.9662_amd64.deb /tmp/wps.deb`（runtime 阶段）与
+>   `COPY wps-office_11.1.0.9662_amd64.deb /tmp/wps-sdk.deb`（builder 阶段）。
 
 ## 使用
 
@@ -39,7 +58,20 @@ docker run --rm -v "$PWD":/data wps-docx2pdf
 ```bash
 pdfinfo output.pdf        # Creator 应为 "WPS 文字"，Pages 2
 pdftotext output.pdf -    # 中文内容完整
+
+# 端到端自动化测试（生成最小 docx → RPC 转换 → 断言 PDF 产物/页数）
+docker run --rm --entrypoint /bin/bash wps-docx2pdf \
+  -c "/opt/wpsrpc-rpc/tests/e2e_test.sh"
 ```
+
+## CI（GitHub Actions）
+
+仓库内置 `.github/workflows/build.yml`，push/PR 到 `main` 时自动：
+
+1. **build job**：`docker/build-push-action` 构建镜像（默认 ARG：官方源 + USTC 镜像，适配境外 runner），带 `type=gha` 构建缓存
+2. **test job**：`docker run --entrypoint /bin/bash ... e2e_test.sh` 在容器内真跑一次 docx→pdf 转换，断言 PDF 产物存在、>1KB、`%PDF-` 头、页数 ≥ 1
+
+> 首次运行约 5–10 分钟（WPS deb ~600MB 拉取 + 构建）；后续命中缓存会显著加快。
 
 ## 目录结构
 
@@ -48,9 +80,12 @@ docker/
 ├── Dockerfile            # 两阶段构建（builder 编译 pywpsrpc + 修复库）
 ├── entrypoint.sh         # 容器入口：Xvfb + dbus + fluxbox + 转换
 ├── convert_docx2pdf.py   # RPC 转换脚本（getWpsApplication → Open → SaveAs2 PDF）
+├── tests/e2e_test.sh     # 端到端测试（CI test job 使用）
+├── .github/workflows/    # GitHub Actions：build + test
 ├── pywpsrpc-src.tar.gz   # pywpsrpc v1.1.0 源码 + wpsrpc-sdk（11MB）
 ├── libexitfix.c          # 修复库①：启动器 exit(1)→exit(0)（源码）
-└── libmqsim.c            # 修复库②：FIFO 模拟 mq_open/mq_timedreceive（源码）
+├── libmqsim.c            # 修复库②：FIFO 模拟 mq_open/mq_timedreceive（源码）
+└── pywpsrpc研究报告.md     # 完整逆向与修复链报告
 ```
 
 ## 关键修复点（Dockerfile 内已内置）
