@@ -13,10 +13,12 @@ concurrency:
 
 env:
   IMAGE_NAME: wps-docx2pdf
+  # WPS deb 附件：GitHub Release 自家 CDN，境外 runner 下载比阿里云更快更稳
+  WPS_DEB_URL: https://github.com/xna00/wps-docker/releases/download/wps-11.1.0.9662/wps-office_11.1.0.9662_amd64.deb
 
 jobs:
   # ------------------------------------------------------------------
-  # 1) 构建镜像（默认官方源 + ustc 镜像拉 WPS deb，适配境外 runner）
+  # 1) 构建镜像（WPS deb 走 GitHub Release，apt/pip 走阿里云，适配境外 runner）
   # ------------------------------------------------------------------
   build:
     runs-on: ubuntu-latest
@@ -34,7 +36,8 @@ jobs:
           context: .
           load: true            # 构建后载入本地，供 test job 使用
           tags: ${{ env.IMAGE_NAME }}:ci
-          # GitHub runner 在境外：使用官方 apt 源 + ustc 镜像拉 WPS deb（默认 ARG）
+          build-args: |
+            WPS_DEB_URL=${{ env.WPS_DEB_URL }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

@@ -13,6 +13,9 @@
 # ----------------------------------------------------------------------
 FROM ubuntu:24.04 AS builder
 
+# WPS deb 完整 URL。默认阿里云（国内构建）；GitHub CI 可用 --build-arg 覆盖为 Release 附件
+ARG WPS_DEB_URL="https://mirrors.aliyun.com/ubuntukylin/pool/partner/wps-office_11.1.0.9662_amd64.deb"
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 # 统一走阿里云镜像源（国内构建快，GitHub 境外 runner 实测也可达）
@@ -45,10 +48,9 @@ COPY pywpsrpc-src.tar.gz /tmp/
 RUN cd /tmp && tar xzf pywpsrpc-src.tar.gz
 
 # --- WPS SDK 库：链接 pywpsrpc 需要 librpcwpsapi_sysqt5.so（仅提取，不完整安装）---
-# 阿里云 ubuntukylin 镜像（已验证 200，国内与 GitHub 境外 runner 均可达）。
 # 注：WPS deb 单文件 ~301MB，超过 GitHub 单文件 100MB 上限，不能 git commit 进仓库，只能远程拉取。
 RUN curl -fL --retry 5 --retry-delay 5 -C - -o /tmp/wps-sdk.deb \
-        "https://mirrors.aliyun.com/ubuntukylin/pool/partner/wps-office_11.1.0.9662_amd64.deb" \
+        "${WPS_DEB_URL}" \
     && dpkg-deb -x /tmp/wps-sdk.deb /tmp/wps-x \
     && mkdir -p /opt/kingsoft/wps-office/office6 \
     && cp /tmp/wps-x/opt/kingsoft/wps-office/office6/librpcwpsapi_sysqt5.so /opt/kingsoft/wps-office/office6/ \
@@ -123,6 +125,9 @@ RUN gcc -shared -fPIC -O2 -o /tmp/libexitfix.so /tmp/libexitfix.c \
 # ----------------------------------------------------------------------
 FROM ubuntu:24.04
 
+# runtime 阶段需重新声明 ARG（每个 FROM 都会重置构建参数作用域）
+ARG WPS_DEB_URL="https://mirrors.aliyun.com/ubuntukylin/pool/partner/wps-office_11.1.0.9662_amd64.deb"
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 # 统一走阿里云镜像源（国内构建快，GitHub 境外 runner 实测也可达）
@@ -143,11 +148,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         poppler-utils python3 ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-# --- WPS Office 11.1.0.9662（阿里云 ubuntukylin 社区仓库，单文件 ~301MB）---
-# 若镜像 URL 失效，可手动下载 wps-office_11.1.0.9662_amd64.deb 放到构建目录，
+# --- WPS Office 11.1.0.9662（默认阿里云 ubuntukylin，CI 可覆盖为 GitHub Release 附件，~301MB）---
+# 若 URL 失效，可手动下载 wps-office_11.1.0.9662_amd64.deb 放到构建目录，
 # 并改用: COPY wps-office_11.1.0.9662_amd64.deb /tmp/wps.deb
 RUN curl -fL --retry 5 --retry-delay 5 -C - -o /tmp/wps.deb \
-        "https://mirrors.aliyun.com/ubuntukylin/pool/partner/wps-office_11.1.0.9662_amd64.deb" \
+        "${WPS_DEB_URL}" \
     && dpkg -i /tmp/wps.deb || apt-get -f install -y \
     && rm -f /tmp/wps.deb \
     && dpkg -l | grep wps-office
