@@ -26,7 +26,7 @@ jobs:
 
       - name: 下载 WPS 12 deb（官网动态签名）
         run: |
-          bash docker/download_wps12.sh /tmp/wps12.deb
+          bash download_wps12.sh /tmp/wps12.deb
           echo "下载大小: $(stat -c %s /tmp/wps12.deb) 字节"
           # sha256 完整性校验（与本地已验证的官网 deb 一致）
           echo "2fa999f60a71e21093ab49ef6d7f61d7668c844bfebf30907d2c290e460f9be0  /tmp/wps12.deb" | sha256sum -c - || {
