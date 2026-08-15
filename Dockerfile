@@ -145,8 +145,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxi6 libxtst6 libnss3 libgbm1 libxslt1.1 libsm6 libcups2 \
         libxrender1 libxext6 libbz2-1.0 libfreetype6 libglib2.0-0 \
         libtiff6 fontconfig fonts-wqy-zenhei fonts-wqy-microhei fonts-noto-cjk \
-        poppler-utils python3 ca-certificates curl \
+        poppler-utils python3 python3-pip ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
+
+# --- HTTP 服务依赖（FastAPI + uvicorn）---
+RUN pip3 install --no-cache-dir --break-system-packages -i https://mirrors.aliyun.com/pypi/simple/ \
+        fastapi "uvicorn[standard]" python-multipart
 
 # --- WPS Office 11.1.0.9662（默认阿里云 ubuntukylin，CI 可覆盖为 GitHub Release 附件，~301MB）---
 # 若 URL 失效，可手动下载 wps-office_11.1.0.9662_amd64.deb 放到构建目录，
@@ -212,12 +216,15 @@ RUN chmod +x /usr/local/bin/gsettings
 # --- 拷贝 pywpsrpc + 修复库 + 转换脚本 ---
 COPY --from=builder /usr/local/lib/python3.12/dist-packages/pywpsrpc /usr/local/lib/python3.12/dist-packages/pywpsrpc
 COPY --from=builder /tmp/libexitfix.so /tmp/libmqsim2.so /opt/wpsrpc-fix/
-COPY convert_docx2pdf.py entrypoint.sh /opt/wpsrpc-rpc/
+COPY convert_docx2pdf.py entrypoint.sh http_server.py /opt/wpsrpc-rpc/
 COPY tests/e2e_test.sh /opt/wpsrpc-rpc/tests/e2e_test.sh
 RUN chmod +x /opt/wpsrpc-rpc/entrypoint.sh /opt/wpsrpc-rpc/tests/e2e_test.sh
 
 # --- 默认工作区 ---
 RUN mkdir -p /data
 WORKDIR /data
+
+# HTTP 服务端口（MODE=api 时使用）
+EXPOSE 8080
 
 ENTRYPOINT ["/opt/wpsrpc-rpc/entrypoint.sh"]

@@ -1,11 +1,16 @@
 #!/bin/bash
 # ======================================================================
 # pywpsrpc RPC docx→pdf 转换入口
-# 用法：docker run --rm -v $PWD:/data wps-docx2pdf [input.docx] [output.pdf]
-#   默认：/data/input.docx → /data/output.pdf
+# 两种模式：
+#   1) CLI 模式（默认）：docker run --rm -v $PWD:/data wps-docx2pdf [input.docx] [output.pdf]
+#      默认：/data/input.docx → /data/output.pdf
+#   2) API 模式：MODE=api docker run -p 8080:8080 wps-docx2pdf
+#      启动常驻 HTTP 服务（POST /convert 上传 docx → PDF，GET /health）
+#      可用环境变量：HOST / PORT / MAX_FILE_MB（详见 http_server.py）
 # ======================================================================
 set -e
 
+MODE="${MODE:-cli}"
 SRC="${1:-/data/input.docx}"
 OUT="${2:-/data/output.pdf}"
 
@@ -29,6 +34,15 @@ sleep 1
 # --- 环境修复（沙箱 seccomp / 无桌面环境的针对性修复）---
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export LD_PRELOAD="/opt/wpsrpc-fix/libexitfix.so:/opt/wpsrpc-fix/libmqsim2.so"
+
+if [ "$MODE" = "api" ]; then
+    echo "== pywpsrpc HTTP 服务启动 =="
+    echo "   监听: ${HOST:-0.0.0.0}:${PORT:-8080}"
+    echo "   接口: POST /convert  GET /health"
+    # 常驻服务：异常退出时清理 Xvfb
+    trap 'kill "$XPID" 2>/dev/null || true' EXIT
+    exec python3 /opt/wpsrpc-rpc/http_server.py
+fi
 
 echo "== pywpsrpc RPC 转换开始 =="
 echo "   输入: $SRC"

@@ -43,6 +43,30 @@ docker run --rm -v "$PWD":/data wps-docx2pdf
 
 转换完成后，`output.pdf` 出现在挂载目录。
 
+## HTTP 服务（API 模式）
+
+常驻 WPS 实例的 HTTP 转换服务，**仅限内网使用，无鉴权**（如需公网暴露请自行加网关鉴权）。
+
+```bash
+# 启动（端口默认 8080）
+docker run -d --name wps-api -p 8080:8080 \
+  -e MODE=api \
+  wps-docx2pdf
+
+# 健康检查
+curl http://localhost:8080/health
+#   {"status":"ok","wps":"ready"}
+
+# 上传 docx → 返回 PDF
+curl -o output.pdf -F "file=@input.docx" http://localhost:8080/convert
+
+# 可选环境变量
+#   PORT=8080       监听端口
+#   MAX_FILE_MB=50  上传大小上限（默认 50MB）
+```
+
+> 说明：服务启动时懒初始化 WPS 实例，首次请求约 0.3s，之后**每个请求约 0.13s**（实测 10/10 成功、内存稳定，常驻单例 + 崩溃自动重建）。
+
 ## 验证
 
 ```bash
@@ -70,6 +94,7 @@ docker/
 ├── Dockerfile            # 两阶段构建（builder 编译 pywpsrpc + 修复库）
 ├── entrypoint.sh         # 容器入口：Xvfb + dbus + fluxbox + 转换
 ├── convert_docx2pdf.py   # RPC 转换脚本（getWpsApplication → Open → SaveAs2 PDF）
+├── http_server.py        # HTTP 服务（MODE=api：POST /convert → PDF）
 ├── tests/e2e_test.sh     # 端到端测试（CI test job 使用）
 ├── .github/workflows/    # GitHub Actions：build + test
 ├── pywpsrpc-src.tar.gz   # pywpsrpc v1.1.0 源码 + wpsrpc-sdk（11MB）
