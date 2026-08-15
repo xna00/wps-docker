@@ -13,30 +13,14 @@
 ## 构建
 
 ```bash
-# 境外/GitHub Actions（默认：官方 apt 源 + USTC 镜像拉 WPS deb）
 docker build -t wps-docx2pdf .
-
-# 国内/内网（阿里云镜像源，构建更快更稳）
-docker build -t wps-docx2pdf \
-  --build-arg APT_MIRROR_BASE="http://mirrors.aliyun.com/ubuntu" \
-  --build-arg PIP_INDEX="https://mirrors.aliyun.com/pypi/simple/" \
-  --build-arg WPS_DEB_BASE="https://mirrors.aliyun.com/ubuntukylin/pool/partner" \
-  .
 ```
 
-### 构建参数（build-arg）
-
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `APT_MIRROR_BASE` | `http://archive.ubuntu.com/ubuntu`（官方） | apt 源；国内可传 `http://mirrors.aliyun.com/ubuntu` |
-| `PIP_INDEX` | `https://pypi.org/simple`（官方） | pip 索引源；国内可传 `https://mirrors.aliyun.com/pypi/simple/` |
-| `WPS_DEB_BASE` | `https://mirrors.aliyun.com/ubuntukylin/pool/partner` | WPS deb 下载镜像目录（已验证 200）；如需覆盖可传其他镜像基址 |
-
+> 所有外部依赖统一走**阿里云镜像**（apt / pip / WPS deb），国内构建快，GitHub 境外 runner 实测同样可达，无需任何 build-arg。
 > 说明：
-> - WPS deb 单文件约 301MB，超过 GitHub 单文件 100MB 上限，**不能 git commit 进仓库**，只能从镜像远程拉取。
-> - 拉取用 `curl -fL --retry 5` 带重试，网络不稳定时不易失败。
-> - 若镜像 URL 全部失效，可手动下载 `wps-office_11.1.0.9662_amd64.deb` 放本目录，
->   把 Dockerfile 中对应两处 `curl ... "${WPS_DEB_BASE}/..."` 改为
+> - WPS deb 单文件约 301MB，超过 GitHub 单文件 100MB 上限，**不能 git commit 进仓库**，构建时从阿里云远程拉取（`curl --retry 5` 带重试）。
+> - 若阿里云镜像 URL 失效，可手动下载 `wps-office_11.1.0.9662_amd64.deb` 放本目录，
+>   把 Dockerfile 中对应两处 `curl ".../wps-office_11.1.0.9662_amd64.deb"` 改为
 >   `COPY wps-office_11.1.0.9662_amd64.deb /tmp/wps.deb`（runtime 阶段）与
 >   `COPY wps-office_11.1.0.9662_amd64.deb /tmp/wps-sdk.deb`（builder 阶段）。
 
@@ -68,7 +52,7 @@ docker run --rm --entrypoint /bin/bash wps-docx2pdf \
 
 仓库内置 `.github/workflows/build.yml`，push/PR 到 `main` 时自动：
 
-1. **build job**：`docker/build-push-action` 构建镜像（默认 ARG：官方源 + USTC 镜像，适配境外 runner），带 `type=gha` 构建缓存
+1. **build job**：`docker/build-push-action` 构建镜像（统一走阿里云源，国内/境外均可用），带 `type=gha` 构建缓存
 2. **test job**：`docker run --entrypoint /bin/bash ... e2e_test.sh` 在容器内真跑一次 docx→pdf 转换，断言 PDF 产物存在、>1KB、`%PDF-` 头、页数 ≥ 1
 
 > 首次运行约 5–10 分钟（WPS deb ~600MB 拉取 + 构建）；后续命中缓存会显著加快。
