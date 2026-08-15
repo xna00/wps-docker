@@ -51,6 +51,7 @@ docker build -t wps-docx2pdf .
 | 参数 | 默认值 | 说明 |
 |---|---|---|
 | `WPS_DEB_URL` | 阿里云 ubuntukylin 完整 deb URL | WPS deb 下载地址。GitHub CI 会覆盖为仓库 Release 附件（自家 CDN 更快）；本地默认走阿里云 |
+| `FONTS_URL` | `github.com/.../releases/download/wps-11.1.0.9662/fonts.tar.xz` | 中文字体包（57MB）下载地址。CI 境外直连 GitHub CDN 秒级；**国内本地构建**建议覆盖为加速代理（实测 `https://ghfast.top/https://github.com/xna00/wps-docker/releases/download/wps-11.1.0.9662/fonts.tar.xz` 约 10s） |
 
 ## 使用
 

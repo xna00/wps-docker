@@ -13,3 +13,4 @@ core.*
 
 # zip 包（仓库已含源码，打包产物不纳入版本控制）
 *.zip
+fonts.tar.xz
