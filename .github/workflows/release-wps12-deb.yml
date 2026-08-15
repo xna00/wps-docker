@@ -1,0 +1,53 @@
+# ======================================================================
+# 手动触发：下载 WPS 12 deb 并上传为 GitHub Release 附件
+#
+# 用途：571MB 的 wps12.deb 手动上传太慢，改由 CI 代劳——
+#   点一下 Run workflow → runner 用 download_wps12.sh 从官网 wpscdn
+#   动态签名下载 → sha256 校验 → 创建/更新 Release wps-12.1.2.28080
+#   并上传附件，供备用镜像（Dockerfile.wps12）的 WPS_DEB_URL 使用。
+#
+# 触发：GitHub Actions 页面 → release-wps12-deb → Run workflow
+# ======================================================================
+name: release-wps12-deb
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 创建/更新 Release 需要写权限
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 下载 WPS 12 deb（官网动态签名）
+        run: |
+          bash docker/download_wps12.sh /tmp/wps12.deb
+          echo "下载大小: $(stat -c %s /tmp/wps12.deb) 字节"
+          # sha256 完整性校验（与本地已验证的官网 deb 一致）
+          echo "2fa999f60a71e21093ab49ef6d7f61d7668c844bfebf30907d2c290e460f9be0  /tmp/wps12.deb" | sha256sum -c - || {
+            echo "::error::deb 校验失败：下载不完整或官网版本已更新（需同步更新本 workflow 与 download_wps12.sh）"
+            exit 1
+          }
+
+      - name: 创建/更新 Release 并上传附件
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="wps-12.1.2.28080"
+          DEB="wps-office_12.1.2.28080.AK.preread.sw.Personal_765474_amd64.deb"
+          mv /tmp/wps12.deb "/tmp/${DEB}"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} 已存在，覆盖上传附件"
+            gh release upload "${TAG}" "/tmp/${DEB}" --clobber
+          else
+            echo "创建 Release ${TAG}"
+            gh release create "${TAG}" "/tmp/${DEB}" \
+              --title "WPS Office 12.1.2.28080 (Linux amd64 deb)" \
+              --notes "WPS Office for Linux 12.1.2.28080 amd64 deb（官网 Personal 版），供 wps2pdf 备用镜像（Dockerfile.wps12）构建时通过 --build-arg WPS_DEB_URL=... 拉取。"
+          fi
+          echo "附件 URL: https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${DEB}"
