@@ -27,6 +27,9 @@ jobs:
     outputs:
       image: ${{ steps.filter.outputs.image }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # paths-filter 需要 diff against event.before
       - uses: dorny/paths-filter@v3
         id: filter
         with:
