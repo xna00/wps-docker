@@ -1,0 +1,15 @@
+# 构建/运行产物
+__pycache__/
+*.pyc
+*.pyo
+*.so
+*.o
+
+# 本地测试输出
+out.pdf
+output.pdf
+*.core
+core.*
+
+# zip 包（仓库已含源码，打包产物不纳入版本控制）
+*.zip
