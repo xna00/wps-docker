@@ -127,6 +127,8 @@ FROM ubuntu:24.04
 
 # runtime 阶段需重新声明 ARG（每个 FROM 都会重置构建参数作用域）
 ARG WPS_DEB_URL="https://mirrors.aliyun.com/ubuntukylin/pool/partner/wps-office_11.1.0.9662_amd64.deb"
+# 中文字体包（fonts.tar.xz，~57MB）：默认走仓库 Release 附件，可覆盖为其他镜像
+ARG FONTS_URL="https://github.com/xna00/wps-docker/releases/download/wps-11.1.0.9662/fonts.tar.xz"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -163,6 +165,18 @@ RUN curl -fL --retry 5 --retry-delay 5 -C - -o /tmp/wps.deb \
 
 # --- libtiff 兼容（WPS 9662 需要 libtiff.so.5）---
 RUN ln -sf /usr/lib/x86_64-linux-gnu/libtiff.so.6 /usr/lib/x86_64-linux-gnu/libtiff.so.5
+
+# --- 常用中文字体（宋体/黑体/楷体/仿宋 + 方正系列 + Times New Roman）---
+# 来源: https://github.com/DoveOutland/Common-Chinese-office-fonts-font-library-
+# 打包为 fonts.tar.xz 随仓库 Release 分发（~57MB，解压后 ~136MB），构建时下载
+# 字体仅供非商业用途，商用需自行授权（详见该仓库 README）
+RUN curl -fL --retry 5 --retry-delay 5 -C - -o /tmp/fonts.tar.xz \
+        "${FONTS_URL}" \
+    && mkdir -p /usr/share/fonts/wps-office \
+    && python3 -c "import tarfile; tarfile.open('/tmp/fonts.tar.xz').extractall('/usr/share/fonts/wps-office/')" \
+    && rm -f /tmp/fonts.tar.xz \
+    && fc-cache -f >/dev/null 2>&1 \
+    && fc-list | grep -cE "宋体|黑体|楷体|仿宋|Times" | xargs echo "内置字体族数:"
 
 # --- 屏蔽 WPS 更新服务器 ---
 RUN sed -i 's|Address0=.*|Address0=http://127.0.0.1/blocked|' \

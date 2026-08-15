@@ -10,6 +10,28 @@
 - 沙箱 seccomp 拦截 `mq_open(O_CREAT)`、无 UKUI 桌面 → 本镜像内置两个 LD_PRELOAD 修复库
 - 正常桌面 Linux + WPS 11.1.0.9662 上**无需**这两个修复库，版本匹配 + `-multiply` 即可
 
+## 内置字体（中文字体来源）
+
+镜像内置 **20 个常用中文字体**（宋体/黑体/楷体/仿宋 + 方正系列 + Times New Roman），确保 WPS 转换时中文按公文字体规范渲染。
+
+**来源仓库**：<https://github.com/DoveOutland/Common-Chinese-office-fonts-font-library->
+
+- 该仓库按《党政机关公文格式》（GB/T 9704-2012）收集常用中文字体，含中易（宋体/黑体/楷体/仿宋）、方正（大标宋/小标宋/仿宋/楷体/黑体）、长城（楷体_GB2312）等
+- **许可提醒**：部分字体仅供**非商业用途**，商用需自行联系字体厂商授权（详见该仓库 README）
+
+**打包方式**：20 个字体文件 `xz -9e` 打包为 `fonts.tar.xz`（约 57MB，解压后约 136MB），随仓库分发，构建时 `COPY` 进镜像解压到 `/usr/share/fonts/wps-office/`，无需联网下载。
+
+**字体清单**：
+
+| 类别 | 字体文件 |
+|---|---|
+| 中易 | 宋体.ttc、黑体.ttf、楷体.ttf、仿宋.ttf |
+| 中易 GB2312 | 仿宋_GB2312.ttf、楷体_GB2312.ttf |
+| 方正 | 方正仿宋_GBK.ttf、方正仿宋简体.ttf、方正大标宋简体.ttf、方正大标宋简繁.ttf、方正小标宋_GBK.ttf、方正小标宋简体.ttf、方正楷体_GBK.ttf、方正楷体简体.ttf、方正黑体_GBK.ttf、方正黑体简体.ttf |
+| 西文 | Times New Roman/times.ttf、timesbd.ttf、timesbi.ttf、timesi.ttf |
+
+**如何更新字体**：上游仓库有更新时，重新下载字体 → `tar -cf - 字体目录 | xz -9e > fonts.tar.xz` → 替换本目录文件 → 提交即可。
+
 ## 构建
 
 ```bash
@@ -98,6 +120,7 @@ docker/
 ├── tests/e2e_test.sh     # 端到端测试（CI test job 使用）
 ├── .github/workflows/    # GitHub Actions：build + test
 ├── pywpsrpc-src.tar.gz   # pywpsrpc v1.1.0 源码 + wpsrpc-sdk（11MB）
+├── fonts.tar.xz          # 常用中文字体包（20 个字体，xz -9e，~57MB）
 ├── libexitfix.c          # 修复库①：启动器 exit(1)→exit(0)（源码）
 ├── libmqsim.c            # 修复库②：FIFO 模拟 mq_open/mq_timedreceive（源码）
 └── pywpsrpc研究报告.md     # 完整逆向与修复链报告
