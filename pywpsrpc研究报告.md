@@ -1,7 +1,7 @@
 # pywpsrpc 项目研究 + WPS Linux docx→pdf 转换研究报告
 
 > 研究时间：2026 年 8 月 | 目标：用通用 WPS Linux + pywpsrpc RPC 完成 docx→pdf 转换
-> 结论：**pywpsrpc RPC 方案已完整跑通**（WPS 11.1.0.9662 + pywpsrpc v1.1.0 + 环境修复链），详见文末"重大更新"章节。
+> 结论：**pywpsrpc RPC 方案已完整跑通**——主镜像 WPS 11.1.0.9662 + pywpsrpc v1.1.0；**备用镜像 WPS 12.1.2.28080 + pywpsrpc 2.4.0 亦实测可用**（三组件转 PDF 通过），详见文末"重大更新"与"WPS 12 验证"章节。
 
 ---
 
@@ -354,3 +354,48 @@ output/demo_rpc_docker.pdf   # ★ Docker 容器产物（183059 字节，Creator
 rpc/                         # 原沙箱 RPC 一键转换方案
 docker/                      # 容器化交付方案（推荐）
 ```
+
+---
+
+## 🔥🔥 WPS 12 验证成功 + 备用镜像（2026-08-15 二次更新）
+
+> **修正此前过时结论**：文中之前"WPS 12.1.0.225xx 之后自动化接口失效"的说法**不准确**。
+> 实测 **WPS 12.1.2.28080 + pywpsrpc 2.4.0 在 Docker 中三组件（wps/wpp/et）RPC 驱动 + 转 PDF 全部成功**。
+> 此前沙箱原生 E_FAIL 的根因是 **沙箱 seccomp 拦截 `mq_open`**（9662 在沙箱原生同样失败），与 WPS 12 本身无关。
+
+### 新发现（本轮逆向/实测）
+
+1. **WPS 12 的 RPC SDK 库改名**：`librpc*_sysqt5.so`（9662）→ `librpc*_wpsqt.so`（12）。
+   - pywpsrpc 1.1.0 写死找 `_sysqt5` → 在 12 下 import 阶段直接失败
+   - **pywpsrpc 2.4.0 的 `project.py` 按 `["wpsqt","sysqt5"]` 顺序探测** → 编译时自动链接 12 的 `_wpsqt`
+2. **RPC 通信机制（strace 还原）**：客户端 `KRpcClient::startExe` 先 `mq_open(/wpsrpc-<ts>-<rand>)`
+   （POSIX 消息队列，非 socket）→ 再经 **daemon 中转**（`connectServerViaDaemon` +
+   `~/.local/share/Kingsoft/daemon/wps-daemon-port`）；
+   沙箱 seccomp 拦 `mq_open` → 客户端 0.1s 返回 `0x80000008`（无任何 connect 调用）。
+3. **pywpsrpc 2.4.0 编译要点**：sip 版本敏感——6.15+ 改 API 编译崩、6.5.x 不支持 Py3.11+ ABI，
+   **sip 6.8.3 正好**；`sip-build` 一条命令，不再需要 v1.1.0 的 sip 5.5 patch / siplib.c patch。
+4. **WPS 12 deb**：官网 Personal 版 571MB（9662 的 301MB），下载走动态签名
+   （`?t=<秒>&k=MD5(key+uri+t)`，key 从 linux.wps.cn 页面源码提取），封装为 `download_wps12.sh`。
+5. **postinst**：WPS 12 的 postinst 需要 `hexdump`（bsdmainutils），缺失报 exit 127（包已解包，可容忍）。
+
+### 验证数据（Docker 内实测）
+
+| 组件 | getApplication | 新建→转 PDF |
+|---|---|---|
+| wps（文字） | S_OK（0.5s） | ✅ 967B |
+| wpp（演示） | S_OK（0.3s） | ✅ 733B |
+| et（表格） | S_OK（0.4s） | ✅ 19960B |
+
+### 交付：备用镜像（docker/Dockerfile.wps12）
+
+- 与主镜像共用 `entrypoint.sh` / `http_server.py` / `convert_docx2pdf.py`（API 兼容），**主镜像零改动**
+- 构建：`docker build -f Dockerfile.wps12 -t wps2pdf-wps12 .`
+  （默认官网签名下载；或 `--build-arg WPS_DEB_URL=<GitHub Release URL>` 走自家 CDN）
+- 备用镜像 **3.08GB**（主镜像 2.07GB）；切换触发场景：9662 deb 源失效 / 新版文档渲染异常
+- 相关文件：`Dockerfile.wps12`、`download_wps12.sh`、`pywpsrpc-2.4.0-src.tar.gz`
+
+### 重要修正（对照文中旧表述）
+
+- 四版本对照表中 12.1.0.17900 / 12.1.2.28080 的 E_FAIL 均为**沙箱 seccomp 环境导致**；
+  在 Docker（默认 seccomp 允许 mq_open）中 12.1.2.28080 完全可用
+- 官方论坛 #62639"自动化失效"与 **库名/版本匹配** 有关：新版 WPS 需配套新版 pywpsrpc（1.1.0→2.4.0）
