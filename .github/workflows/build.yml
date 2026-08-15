@@ -71,3 +71,50 @@ jobs:
       - name: Run end-to-end conversion test
         # 用 --entrypoint 覆盖镜像默认的 entrypoint（否则命令行参数会被当成输入文件）
         run: docker run --rm --entrypoint /bin/bash ${{ env.IMAGE_NAME }}:ci -c "/opt/wpsrpc-rpc/tests/e2e_test.sh"
+
+  # ------------------------------------------------------------------
+  # 3) 推送镜像到 Docker Hub（build+test 都通过才推）
+  #    - push 到 main        → 推 latest
+  #    - 打 tag v*（release） → 推 latest + 版本号
+  #    需要仓库 Secrets：DOCKERHUB_USERNAME、DOCKERHUB_TOKEN
+  # ------------------------------------------------------------------
+  push-dockerhub:
+    needs: [build, test]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: meta
+        run: |
+          REPO="${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}"
+          TAGS="$REPO:latest"
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VER="${GITHUB_REF_NAME}"
+            TAGS="$TAGS,$REPO:${VER}"
+          fi
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "将推送: ${TAGS}"
+
+      - name: Build and push to Docker Hub
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            WPS_DEB_URL=${{ env.WPS_DEB_URL }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
