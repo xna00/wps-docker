@@ -1,12 +1,12 @@
-# pywpsrpc RPC docx→pdf 转换镜像
+# pywpsrpc RPC 文档转 PDF 镜像（docx / pptx / xlsx / wps / et …）
 
-用 **WPS 11.1.0.9662 + pywpsrpc v1.1.0 原生 RPC** 将 docx 转为 PDF 的 Docker 方案。
+用 **WPS 11.1.0.9662 + pywpsrpc v1.1.0 原生 RPC** 将 Office/WPS/ODF 等格式文档转为 PDF 的 Docker 方案。
 
 ## 背景（为什么需要这个组合）
 
 - WPS 12.1.0.225xx 之后 Linux 自动化接口（COM/RPC）普遍失效（官方论坛 bbs.wps.cn/topic/62639 佐证）
 - WPS 11.1.0.11723+ 的 RPC server 不 LISTEN；**11.1.0.9662（2020 年）RPC server 正常**
-- 9662 的客户端库是 `librpcwpsapi_sysqt5.so`，需配套 **pywpsrpc v1.1.0**（本镜像已源码编译）
+- 9662 的客户端库是 `librpcwpsapi_sysqt5.so`（另含 `librpcwppapi_sysqt5.so` / `librpcetapi_sysqt5.so`），需配套 **pywpsrpc v1.1.0**（本镜像已源码编译，wps/wpp/et 三模块全量编译）
 - 沙箱 seccomp 拦截 `mq_open(O_CREAT)`、无 UKUI 桌面 → 本镜像内置两个 LD_PRELOAD 修复库
 - 正常桌面 Linux + WPS 11.1.0.9662 上**无需**这两个修复库，版本匹配 + `-multiply` 即可
 

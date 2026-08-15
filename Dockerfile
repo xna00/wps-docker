@@ -53,9 +53,18 @@ RUN curl -fL --retry 5 --retry-delay 5 -C - -o /tmp/wps-sdk.deb \
         "${WPS_DEB_URL}" \
     && dpkg-deb -x /tmp/wps-sdk.deb /tmp/wps-x \
     && mkdir -p /opt/kingsoft/wps-office/office6 \
-    && cp /tmp/wps-x/opt/kingsoft/wps-office/office6/librpcwpsapi_sysqt5.so /opt/kingsoft/wps-office/office6/ \
-    && ls -la /opt/kingsoft/wps-office/office6/librpcwpsapi_sysqt5.so \
+    && cp /tmp/wps-x/opt/kingsoft/wps-office/office6/librpcwpsapi_sysqt5.so \
+          /tmp/wps-x/opt/kingsoft/wps-office/office6/librpcwppapi_sysqt5.so \
+          /tmp/wps-x/opt/kingsoft/wps-office/office6/librpcetapi_sysqt5.so \
+          /opt/kingsoft/wps-office/office6/ \
+    && ls -la /opt/kingsoft/wps-office/office6/librpc*sysqt5.so \
     && rm -f /tmp/wps-sdk.deb && rm -rf /tmp/wps-x
+
+# --- 修复 IKRpcClient.sip 缺 #include <string>(gcc 严格模式不再传递包含, 导致 u16string 编译失败) ---
+RUN cd /tmp/pywpsrpc-full \
+    && sed -i 's|    #include <list>|    #include <list>\n    #include <string>|' \
+        sip/rpcwppapi/IKRpcClient.sip sip/rpcetapi/IKRpcClient.sip \
+    && grep -c "#include <string>" sip/rpcwppapi/IKRpcClient.sip sip/rpcetapi/IKRpcClient.sip
 
 # --- 生成 sip 项目（编译失败可忽略，产物用于后续 patch + 分模块编译）---
 WORKDIR /tmp/pywpsrpc-full
@@ -96,13 +105,17 @@ open(p, 'w').write(src)
 print('siplib.c patched')
 PYEOF
 
-# --- 分模块编译：common / rpcwpsapi / sip（跳过会报错的 rpcwppapi、rpcetapi）---
+# --- 分模块编译：common / sip / rpcwpsapi / rpcwppapi / rpcetapi ---
 RUN cd /tmp/pywpsrpc-full/build/common && make -j$(nproc) 2>&1 | tail -2
 RUN cd /tmp/pywpsrpc-full/build/rpcwpsapi && make -j$(nproc) 2>&1 | grep -E "undefined reference|cannot find" | head -15
 RUN cd /tmp/pywpsrpc-full/build/sip && make -j$(nproc) 2>&1 | tail -2
+RUN cd /tmp/pywpsrpc-full/build/rpcwppapi && make -j$(nproc) 2>&1 | tail -2
+RUN cd /tmp/pywpsrpc-full/build/rpcetapi && make -j$(nproc) 2>&1 | tail -2
 RUN ls -la /tmp/pywpsrpc-full/build/sip/sip.so \
         /tmp/pywpsrpc-full/build/common/common.so \
-        /tmp/pywpsrpc-full/build/rpcwpsapi/rpcwpsapi.so
+        /tmp/pywpsrpc-full/build/rpcwpsapi/rpcwpsapi.so \
+        /tmp/pywpsrpc-full/build/rpcwppapi/rpcwppapi.so \
+        /tmp/pywpsrpc-full/build/rpcetapi/rpcetapi.so
 
 # --- 安装到 Python 3.12 的 dist-packages（从子目录产物拷贝）---
 RUN SP=$(python3 -c 'import site; print(site.getsitepackages()[0])') \
@@ -111,6 +124,8 @@ RUN SP=$(python3 -c 'import site; print(site.getsitepackages()[0])') \
     && cp /tmp/pywpsrpc-full/py/utils.py $SP/pywpsrpc/ \
     && cp /tmp/pywpsrpc-full/build/common/common.so $SP/pywpsrpc/ \
     && cp /tmp/pywpsrpc-full/build/rpcwpsapi/rpcwpsapi.so $SP/pywpsrpc/ \
+    && cp /tmp/pywpsrpc-full/build/rpcwppapi/rpcwppapi.so $SP/pywpsrpc/ \
+    && cp /tmp/pywpsrpc-full/build/rpcetapi/rpcetapi.so $SP/pywpsrpc/ \
     && cp /tmp/pywpsrpc-full/build/sip/sip.so $SP/pywpsrpc/ \
     && ls -la $SP/pywpsrpc/
 
