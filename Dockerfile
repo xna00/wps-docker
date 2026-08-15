@@ -13,10 +13,13 @@
 # ----------------------------------------------------------------------
 FROM ubuntu:24.04 AS builder
 
+ARG APT_MIRROR_BASE="http://archive.ubuntu.com/ubuntu"
+ARG PIP_INDEX="https://pypi.org/simple"
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 换国内 apt 源（沙箱/内网无法访问官方 archive.ubuntu.com）
-RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|http://mirrors.aliyun.com/ubuntu/|g; s|http://security.ubuntu.com/ubuntu/|http://mirrors.aliyun.com/ubuntu/|g' \
+# 默认 Ubuntu 官方源（适用于 GitHub Actions 等境外 runner）；
+# 国内/内网构建可传: --build-arg APT_MIRROR_BASE=http://mirrors.aliyun.com/ubuntu
+RUN sed -i "s|http://archive.ubuntu.com/ubuntu|${APT_MIRROR_BASE}|g; s|http://security.ubuntu.com/ubuntu|${APT_MIRROR_BASE}|g" \
         /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -24,8 +27,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-# pip 换阿里云源（Ubuntu 24.04 PEP668 保护，用 --break-system-packages）
-RUN pip3 config set global.index-url https://mirrors.aliyun.com/pypi/simple/
+# pip 索引源可覆盖（默认官方；国内构建传 --build-arg PIP_INDEX=https://mirrors.aliyun.com/pypi/simple/）
+RUN pip3 config set global.index-url ${PIP_INDEX}
 
 # sip 5.5.0（最后一个 sip5，官方只支持到 Py3.9，需 patch 支持 3.12）
 RUN pip3 install --no-cache-dir --break-system-packages sip==5.5.0
@@ -45,8 +48,12 @@ COPY pywpsrpc-src.tar.gz /tmp/
 RUN cd /tmp && tar xzf pywpsrpc-src.tar.gz
 
 # --- WPS SDK 库：链接 pywpsrpc 需要 librpcwpsapi_sysqt5.so（仅提取，不完整安装）---
-ADD https://mirrors.aliyun.com/ubuntukylin/pool/partner/wps-office_11.1.0.9662_amd64.deb /tmp/wps-sdk.deb
-RUN dpkg-deb -x /tmp/wps-sdk.deb /tmp/wps-x \
+# WPS deb 默认走 ubuntukylin 镜像；国内/内网构建可覆盖 WPS_DEB_BASE 指向阿里云等镜像。
+# 注：WPS deb 单文件 ~301MB，超过 GitHub 单文件 100MB 上限，不能 git commit 进仓库，只能远程拉取。
+ARG WPS_DEB_BASE="https://mirrors.ustc.edu.cn/ubuntukylin/pool/partner"
+RUN curl -fL --retry 5 --retry-delay 5 -C - -o /tmp/wps-sdk.deb \
+        "${WPS_DEB_BASE}/wps-office_11.1.0.9662_amd64.deb" \
+    && dpkg-deb -x /tmp/wps-sdk.deb /tmp/wps-x \
     && mkdir -p /opt/kingsoft/wps-office/office6 \
     && cp /tmp/wps-x/opt/kingsoft/wps-office/office6/librpcwpsapi_sysqt5.so /opt/kingsoft/wps-office/office6/ \
     && ls -la /opt/kingsoft/wps-office/office6/librpcwpsapi_sysqt5.so \
@@ -120,10 +127,14 @@ RUN gcc -shared -fPIC -O2 -o /tmp/libexitfix.so /tmp/libexitfix.c \
 # ----------------------------------------------------------------------
 FROM ubuntu:24.04
 
+# runtime 阶段需重新声明 ARG（每个 FROM 都会重置构建参数作用域）
+ARG APT_MIRROR_BASE="http://archive.ubuntu.com/ubuntu"
+ARG WPS_DEB_BASE="https://mirrors.ustc.edu.cn/ubuntukylin/pool/partner"
+
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 换国内 apt 源
-RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|http://mirrors.aliyun.com/ubuntu/|g; s|http://security.ubuntu.com/ubuntu/|http://mirrors.aliyun.com/ubuntu/|g' \
+# 默认 Ubuntu 官方源（境外 runner 用）；国内构建传 --build-arg APT_MIRROR_BASE=http://mirrors.aliyun.com/ubuntu
+RUN sed -i "s|http://archive.ubuntu.com/ubuntu|${APT_MIRROR_BASE}|g; s|http://security.ubuntu.com/ubuntu|${APT_MIRROR_BASE}|g" \
         /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
 
 # --- 运行时依赖（Xvfb / Qt5 / 字体 / WPS 9662 的旧依赖）---
@@ -137,14 +148,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxi6 libxtst6 libnss3 libgbm1 libxslt1.1 libsm6 libcups2 \
         libxrender1 libxext6 libbz2-1.0 libfreetype6 libglib2.0-0 \
         libtiff6 fontconfig fonts-wqy-zenhei fonts-wqy-microhei fonts-noto-cjk \
-        python3 ca-certificates curl \
+        poppler-utils python3 ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-# --- WPS Office 11.1.0.9662（社区/麒麟仓库镜像，下载 301MB）---
-# 若此 URL 失效，可手动下载 wps-office_11.1.0.9662_amd64.deb 放到构建目录，
-# 并把下面 ADD 行换成: COPY wps-office_11.1.0.9662_amd64.deb /tmp/wps.deb
-ADD https://mirrors.aliyun.com/ubuntukylin/pool/partner/wps-office_11.1.0.9662_amd64.deb /tmp/wps.deb
-RUN dpkg -i /tmp/wps.deb || apt-get -f install -y \
+# --- WPS Office 11.1.0.9662（ubuntukylin 社区仓库，单文件 ~301MB）---
+# 默认走 ustc 镜像（境外可达）；国内/内网构建传 --build-arg WPS_DEB_BASE=https://mirrors.aliyun.com/ubuntukylin/pool/partner
+# 若镜像 URL 失效，可手动下载 wps-office_11.1.0.9662_amd64.deb 放到构建目录，
+# 并改用: COPY wps-office_11.1.0.9662_amd64.deb /tmp/wps.deb
+RUN curl -fL --retry 5 --retry-delay 5 -C - -o /tmp/wps.deb \
+        "${WPS_DEB_BASE}/wps-office_11.1.0.9662_amd64.deb" \
+    && dpkg -i /tmp/wps.deb || apt-get -f install -y \
     && rm -f /tmp/wps.deb \
     && dpkg -l | grep wps-office
 
@@ -204,7 +217,8 @@ RUN chmod +x /usr/local/bin/gsettings
 COPY --from=builder /usr/local/lib/python3.12/dist-packages/pywpsrpc /usr/local/lib/python3.12/dist-packages/pywpsrpc
 COPY --from=builder /tmp/libexitfix.so /tmp/libmqsim2.so /opt/wpsrpc-fix/
 COPY convert_docx2pdf.py entrypoint.sh /opt/wpsrpc-rpc/
-RUN chmod +x /opt/wpsrpc-rpc/entrypoint.sh
+COPY tests/e2e_test.sh /opt/wpsrpc-rpc/tests/e2e_test.sh
+RUN chmod +x /opt/wpsrpc-rpc/entrypoint.sh /opt/wpsrpc-rpc/tests/e2e_test.sh
 
 # --- 默认工作区 ---
 RUN mkdir -p /data
