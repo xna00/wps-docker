@@ -104,8 +104,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxcb-xkb1 libxkbcommon-x11-0 libxcomposite1 libxcursor1 libxrandr2 \
         libxi6 libxtst6 libnss3 libgbm1 libxslt1.1 libsm6 libcups2 \
         libxrender1 libxext6 libbz2-1.0 libfreetype6 libglib2.0-0 \
-        libtiff6 fontconfig fonts-wqy-zenhei fonts-wqy-microhei fonts-noto-cjk \
-        poppler-utils python3 python3-pip ca-certificates curl \
+        libtiff6 fontconfig poppler-utils python3 python3-pip ca-certificates curl \
         bsdmainutils \
     && rm -rf /var/lib/apt/lists/*
 
@@ -128,14 +127,9 @@ RUN chmod +x /tmp/download_wps12.sh \
     && rm -f /tmp/wps.deb \
     && dpkg -l | grep wps-office || true
 
-# --- 常用中文字体（复用主镜像 Release 附件 fonts.tar.xz）---
-RUN curl -fL --retry 5 --retry-delay 3 -C - -o /tmp/fonts.tar.xz \
-        "${FONTS_URL}" \
-    && mkdir -p /usr/share/fonts/wps-office \
-    && python3 -c "import tarfile; tarfile.open('/tmp/fonts.tar.xz').extractall('/usr/share/fonts/wps-office/')" \
-    && rm -f /tmp/fonts.tar.xz \
-    && fc-cache -f >/dev/null 2>&1 \
-    && fc-list | grep -cE "宋体|黑体|楷体|仿宋|Times" | xargs echo "内置字体族数:"
+# --- 字体安装（与主镜像共用 fonts_setup.sh，逻辑见该脚本注释）---
+COPY fonts_setup.sh /tmp/fonts_setup.sh
+RUN bash /tmp/fonts_setup.sh "${FONTS_URL}" && rm -f /tmp/fonts_setup.sh
 
 # --- 屏蔽 WPS 更新服务器 ---
 RUN sed -i 's|Address0=.*|Address0=http://127.0.0.1/blocked|' \

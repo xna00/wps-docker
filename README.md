@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/xna00/wps-docker/actions/workflows/build.yml/badge.svg)](https://github.com/xna00/wps-docker/actions)
 
-用 **WPS 11.1.0.9662 + pywpsrpc v2.4.0 原生 RPC** 将 Office/WPS/ODF 等 **16 种格式**文档转为 PDF 的 Docker 方案。内置 20 个中文字体，支持 CLI 与 HTTP API 两种使用方式。
+用 **WPS 11.1.0.9662 + pywpsrpc v2.4.0 原生 RPC** 将 Office/WPS/ODF 等 **16 种格式**文档转为 PDF 的 Docker 方案。内置 20 个中文字体 + 思源黑体（Noto Sans SC），并内置"微软雅黑/等线/Calibri"等缺失字体名 → 思源黑体/Carlito 的映射，支持 CLI 与 HTTP API 两种使用方式。
 
 ## 快速开始
 
@@ -137,7 +137,24 @@ docker build -f Dockerfile.wps12 -t wps2pdf-wps12 \
 | 方正 | 方正仿宋_GBK.ttf、方正仿宋简体.ttf、方正大标宋简体.ttf、方正大标宋简繁.ttf、方正小标宋_GBK.ttf、方正小标宋简体.ttf、方正楷体_GBK.ttf、方正楷体简体.ttf、方正黑体_GBK.ttf、方正黑体简体.ttf |
 | 西文 | Times New Roman/times.ttf、timesbd.ttf、timesbi.ttf、timesi.ttf |
 
-**如何更新字体**：上游仓库有更新时，重新下载字体 → `tar -cf - 字体目录 | xz -9e > fonts.tar.xz` → 替换本目录文件 → 提交即可。
+### 缺失字体名映射（构建时生成，无需联网）
+
+文档（尤其 Google Docs 导出、网页模板、现代 Office）常指定镜像里**不存在的字体名**；WPS 对缺失字体硬编码回落**宋体**（中文）/ URW Bookman（西文），观感差。**所有字体逻辑集中在 `fonts_setup.sh` 一个脚本**（apt 开源字体 + fonts.tar.xz + 思源黑体 SC 生成 + 别名 conf），构建时执行一次，核心两层处理：
+
+1. **Noto Sans SC 独立字面**：用 fonttools 从自带 `NotoSansCJK-*.ttc` 抽取 **SC 字面**（index 2）生成独立 `NotoSansSC-Regular/Bold.otf`（家族名精确为 "Noto Sans SC"）。不用 ttc 集合是为了避免 WPS 加载 .ttc 时退回第 0 面（JP 字面）的问题。
+2. **fontconfig scan 别名**（写入 `/etc/fonts/conf.d/99-font-aliases.conf`）：把常见缺失名字在扫描阶段追加为真实家族名（WPS 只认字体枚举里出现的名字，不认 pattern 别名）：
+
+| 文档指定 | 实际渲染 | 说明 |
+|---|---|---|
+| Noto Sans SC | 思源黑体 SC | 生成的真实家族名 |
+| 微软雅黑 / Microsoft YaHei / Microsoft YaHei UI | 思源黑体 SC | **版权原因不随镜像分发微软雅黑**，用同设计（黑体）映射 |
+| 等线 / DengXian | 思源黑体 SC | Win10/11 Office 中文默认字体 |
+| Noto Sans | 思源黑体 SC | 纯西文名，思源含完整 Latin 字形 |
+| Calibri / Cambria | Carlito / Caladea | apt 安装的度量兼容 OFL 替代（LibreOffice 同款方案） |
+
+> 验证：e2e 测试含"指定微软雅黑 → 嵌入 NotoSansSC 且无 SimSun"断言；也可 `docker run --rm --entrypoint /bin/bash wps2pdf -c 'fc-match 微软雅黑; fc-match Calibri'` 查看映射结果。
+
+**如何更新字体**：上游仓库有更新时，重新下载字体 → `tar -cf - 字体目录 | xz -9e > fonts.tar.xz` → 替换本目录文件 → 提交即可。新增缺失字体名映射只需编辑 `fonts_setup.sh` 中的别名 conf 段（第 [4/5] 步 heredoc）。
 
 ## CI（GitHub Actions）
 
@@ -161,6 +178,7 @@ docker/
 ├── tests/e2e_test.sh     # 端到端测试（CI test job 使用）
 ├── .github/workflows/    # GitHub Actions：build + test
 ├── pywpsrpc-2.4.0-src.tar.gz  # pywpsrpc v2.4.0 源码 + wpsrpc-sdk（2.2MB，主/备用镜像共用）
+├── fonts_setup.sh        # 字体统一安装脚本：apt 开源字体 + fonts.tar.xz + Noto Sans SC 生成 + 别名 conf
 ├── fonts.tar.xz          # 常用中文字体包（20 个字体，xz -9e，~57MB）
 ├── libexitfix.c          # 修复库①：启动器 exit(1)→exit(0)（源码，2.4.0 不再 preload）
 ├── libmqsim.c            # 修复库②：FIFO 模拟 mq_open/mq_timedreceive（源码）
