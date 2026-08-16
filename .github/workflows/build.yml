@@ -75,10 +75,12 @@ jobs:
   # ------------------------------------------------------------------
   build:
     needs: changes
-    # main push 按 paths-filter 判断（仅镜像相关文件变化才构建）；PR / 手动触发直接放行
+    # 发布提交（带 v* tag）必须无条件构建+测试+发布，不受 paths-filter 影响；
+    # 其余 main push 按 paths-filter 判断（仅镜像相关文件变化才构建）；PR / 手动触发直接放行
     if: |
       github.event_name == 'pull_request' ||
       github.event_name == 'workflow_dispatch' ||
+      needs.changes.outputs.release == 'true' ||
       needs.changes.outputs.image == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
