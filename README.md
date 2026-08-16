@@ -77,6 +77,62 @@ docker run --rm --entrypoint /bin/bash wps2pdf \
   -c "/opt/wpsrpc-rpc/tests/e2e_test.sh"
 ```
 
+## 部署指南（生产）
+
+### 方案：单机部署（后端容器 + 可选转发层）
+
+**1) 后端容器（WPS 转换引擎，必装）**
+
+```bash
+docker run -d --name wps \
+  -p 8080:8080 \
+  --memory 2g --memory-swap 2g \
+  --restart unless-stopped \
+  -e MODE=api \
+  xna00/wps2pdf:latest
+```
+
+- 接口：`POST /convert`（multipart `file=<文档>` → PDF 二进制）、`GET /health`
+- 可选环境变量：`PORT`（默认 8080）、`MAX_FILE_MB`（默认 50）
+
+**2) 转发层（可选：带上传 UI 的网页）**
+
+仓库外另有 `webapp/` 目录（FastAPI 转发层）：提供上传页面并反向代理到后端。
+
+```bash
+PORT=3000 UPSTREAM=http://127.0.0.1:8080 python3 forwarder.py   # 生产建议 systemd 托管
+```
+
+或只做反向代理：nginx/caddy 把 `/convert`、`/health` 代理到 8080 即可。
+
+**3) 验证**
+
+```bash
+curl http://localhost:8080/health                 # {"status":"ok",...}
+curl -o out.pdf -F "file=@报告.docx" http://localhost:8080/convert
+```
+
+### 生产注意事项
+
+| 事项 | 建议 |
+|---|---|
+| **内存** | WPS 服务中约 1GB、空闲自动回落 ~360MB；务必加 `--memory 2g` 上限防异常暴涨 |
+| **鉴权** | API **无鉴权**，仅限内网；公网暴露必须前置网关鉴权（basic auth / token / 网关白名单） |
+| **字体** | 已内置思源黑体（Noto Sans SC TTF）+ 微软雅黑/等线/Calibri 等映射，开箱即用，无需配置 |
+| **升级** | `docker pull xna00/wps2pdf:latest` → `docker rm -f wps` → 重新 `docker run`（或 compose `up -d`） |
+| **日志** | `docker logs -f wps`；接口错误会打印 `[err]/[warn]`（含 WPS 重建记录） |
+| **健康监控** | 定时 `GET /health`，`status:ok` 即存活；单请求超时 180s |
+
+### 发布新版本（CI 自动构建 + 发布 Docker Hub）
+
+```bash
+git commit ...
+git tag v1.6.0
+git push origin main v1.6.0    # 显式同推 main+tag；CI 检测到 v* tag → build+test → 发布 latest+v1.6.0
+```
+
+> 注意：不要 `git push --tags`（只推 tag 不推 main，不触发 CI）；也不要发布后立刻推 follow-up 提交（同 ref 的并发取消会杀掉发布 run）。
+
 ## WPS 12 备用镜像（Dockerfile.wps12）
 
 主镜像（9662 + pywpsrpc 2.4.0）稳定运行中；`Dockerfile.wps12` 提供 **WPS 12.1.2.28080 + pywpsrpc 2.4.0** 的备用构建路径，用于：
