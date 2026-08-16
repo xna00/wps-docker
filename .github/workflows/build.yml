@@ -26,6 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       image: ${{ steps.filter.outputs.image }}
+      skip: ${{ steps.tagcheck.outputs.skip }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -50,6 +51,21 @@ jobs:
               - '.github/workflows/**'
               - '.dockerignore'
 
+      # 同一提交 push main + 打 tag 会触发两个 run（main / tag）。
+      # main run 若发现 HEAD 已被 tag 覆盖，直接跳过全部构建——
+      # 完整构建+测试+发布由 tag run 独占执行，避免重复跑一遍 CI。
+      - name: 跳过已被 tag 的 main push（tag run 负责构建+发布）
+        id: tagcheck
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/main')
+        run: |
+          git fetch --tags --prune --quiet
+          if git tag --points-at "$GITHUB_SHA" | grep -q .; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::HEAD(${GITHUB_SHA:0:7}) 已被 tag 覆盖，本次 run 跳过，由 tag run 完成构建+发布"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
   # ------------------------------------------------------------------
   # 1) 构建镜像（WPS deb 走 GitHub Release，apt/pip 走阿里云，适配境外 runner）
   # ------------------------------------------------------------------
@@ -57,10 +73,11 @@ jobs:
     needs: changes
     # tag 发布 / PR / 手动触发 直接放行；push main 仅镜像相关文件变化才构建
     if: |
-      startsWith(github.ref, 'refs/tags/') ||
-      github.event_name == 'pull_request' ||
-      github.event_name == 'workflow_dispatch' ||
-      needs.changes.outputs.image == 'true'
+      needs.changes.outputs.skip != 'true' &&
+      (startsWith(github.ref, 'refs/tags/') ||
+       github.event_name == 'pull_request' ||
+       github.event_name == 'workflow_dispatch' ||
+       needs.changes.outputs.image == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -113,13 +130,14 @@ jobs:
         run: docker run --rm --entrypoint /bin/bash ${{ env.IMAGE_NAME }}:ci -c "/opt/wpsrpc-rpc/tests/e2e_test.sh"
 
   # ------------------------------------------------------------------
-  # 3) 推送镜像到 Docker Hub（仅打 tag v* 时发布，其余 push/PR 只构建+测试）
+  # 3) 推送镜像到 Docker Hub（仅打 v* 标签时发布，其余 push/PR 只构建+测试）
   #    - 打 tag v*（release） → 推 latest + 版本号
+  #    - main run 若 HEAD 已被 tag 覆盖会整体跳过，本 job 只会在 tag run 里执行
   #    需要仓库 Secrets：DOCKERHUB_USERNAME、DOCKERHUB_TOKEN
   # ------------------------------------------------------------------
   push-dockerhub:
     needs: [build, test]
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
