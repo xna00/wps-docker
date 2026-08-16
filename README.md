@@ -161,7 +161,7 @@ docker build -f Dockerfile.wps12 -t wps2pdf-wps12 \
 仓库内置 `.github/workflows/build.yml`，push/PR 到 `main` 时自动：
 
 1. **build job**：`docker/build-push-action` 构建镜像（WPS deb 走仓库 Release 附件 CDN，apt/pip 走阿里云），带 `type=gha` 构建缓存
-2. **test job**：`docker run --entrypoint /bin/bash ... e2e_test.sh` 在容器内真跑一次 docx→pdf 转换，断言 PDF 产物存在、>1KB、`%PDF-` 头、页数 ≥ 1
+2. **test job**：`docker run --entrypoint /bin/bash ... e2e_test.sh` 在容器内真跑 docx/pptx/csv→pdf 转换（覆盖 wps/wpp/et 三组件路由），断言 PDF 产物存在、`%PDF-` 头、微软雅黑→思源黑体映射、体积 < 5MB
 
 > 仅镜像相关文件变化才触发构建（PR/手动触发无条件）；纯文档改动自动跳过。首次运行约 5–10 分钟（WPS deb ~600MB 拉取 + 构建）；后续命中缓存会显著加快。
 

@@ -1,11 +1,12 @@
 #!/bin/bash
 # ======================================================================
-# pywpsrpc RPC docx→pdf 转换入口
+# pywpsrpc RPC 文档→PDF 转换入口
 # 两种模式：
-#   1) CLI 模式（默认）：docker run --rm -v $PWD:/data wps-docx2pdf [input.docx] [output.pdf]
+#   1) CLI 模式（默认）：docker run --rm -v $PWD:/data wps-docx2pdf [input] [output.pdf]
 #      默认：/data/input.docx → /data/output.pdf
+#      按扩展名自动路由到对应组件（wps/wpp/et），支持 Word/PPT/Excel/WPS/ODF/txt/csv/html 等
 #   2) API 模式：MODE=api docker run -p 8080:8080 wps-docx2pdf
-#      启动常驻 HTTP 服务（POST /convert 上传 docx → PDF，GET /health）
+#      启动常驻 HTTP 服务（POST /convert 上传文档 → PDF，GET /health）
 #      可用环境变量：HOST / PORT / MAX_FILE_MB（详见 http_server.py）
 # ======================================================================
 set -e
@@ -60,10 +61,18 @@ echo "   输入: $SRC"
 echo "   输出: $OUT"
 
 # 用 if 包裹：python3 失败时不被 set -e 中断，保证走到清理/退出码打印
-if python3 /opt/wpsrpc-rpc/convert_docx2pdf.py "$SRC" "$OUT"; then
+# entrypoint 层兜底超时（默认 300s）：python 内部另有 180s 主超时（子进程强杀 + 友好报错，
+# 见 convert_docx2pdf.py CONVERT_TIMEOUT），这里只在内部机制失效时兜底，避免 CLI 无限等待。
+# 可用 CONVERT_TIMEOUT 环境变量覆盖；超时后转明确失败码
+CONVERT_TIMEOUT="${CONVERT_TIMEOUT:-300}"
+if timeout --signal=TERM --kill-after=10 "$CONVERT_TIMEOUT" python3 /opt/wpsrpc-rpc/convert_docx2pdf.py "$SRC" "$OUT"; then
     RC=0
 else
     RC=$?
+    if [ "$RC" -eq 124 ]; then
+        echo "== 转换超时（${CONVERT_TIMEOUT}s）已被终止 ==" >&2
+        RC=1
+    fi
 fi
 
 kill "$XPID" 2>/dev/null || true

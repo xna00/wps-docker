@@ -1,6 +1,6 @@
 #!/bin/bash
 # ======================================================================
-# 端到端测试：在容器内用 pywpsrpc RPC 真跑一次 docx→pdf，并断言产出
+# 端到端测试：在容器内用 pywpsrpc RPC 真跑 docx/pptx/csv→pdf（覆盖 wps/wpp/et 三组件路由），并断言产出
 # 用法：在已构建的 wps-docx2pdf 镜像内执行：
 #   /opt/wpsrpc-rpc/tests/e2e_test.sh
 # 退出码：0=通过，非0=失败
@@ -173,6 +173,44 @@ if [ "$YAHEI_SIZE" -gt $((5 * 1024 * 1024)) ]; then
     exit 1
 fi
 echo "   体积断言通过（< 5MB，字体正常子集化）"
+
+echo ""
+echo "== [6/5] 路由断言：CLI 按扩展名分发到 wpp / et 组件 =="
+
+# 6a) .pptx -> wpp（演示文稿组件）
+# 注：不测 .odp —— WPS wpp 对 ODP 导出 PDF 存在上游 bug（Open 成功但 Export 挂起，已实测
+#     最小/完整 ODP 均超时挂死），故用 python-pptx 生成的合法 fixture 验证 wpp 路由。
+cp /opt/wpsrpc-rpc/tests/fixtures/route.pptx "$WORK/route.pptx"
+set +e
+python3 /opt/wpsrpc-rpc/convert_docx2pdf.py "$WORK/route.pptx" "$WORK/route_wpp.pdf"
+WPP_RC=$?
+set -e
+if [ "$WPP_RC" -ne 0 ]; then
+    echo "FAIL: .pptx 路由/转换失败 (rc=$WPP_RC)"
+    exit 1
+fi
+if [ ! -s "$WORK/route_wpp.pdf" ] || [ "$(head -c5 "$WORK/route_wpp.pdf")" != "%PDF-" ]; then
+    echo "FAIL: .pptx 未生成合法 PDF"
+    exit 1
+fi
+echo "   .pptx -> wpp 路由通过"
+
+# 6b) .csv -> et（表格组件）
+printf 'name,score\nAlice,90\nBob,85\n' > "$WORK/route.csv"
+set +e
+python3 /opt/wpsrpc-rpc/convert_docx2pdf.py "$WORK/route.csv" "$WORK/route_csv.pdf"
+CSV_RC=$?
+set -e
+if [ "$CSV_RC" -ne 0 ]; then
+    echo "FAIL: .csv 路由/转换失败 (rc=$CSV_RC)"
+    exit 1
+fi
+if [ ! -s "$WORK/route_csv.pdf" ] || [ "$(head -c5 "$WORK/route_csv.pdf")" != "%PDF-" ]; then
+    echo "FAIL: .csv 未生成合法 PDF"
+    exit 1
+fi
+echo "   .csv -> et 路由通过"
+echo "   路由断言通过（wpp / et 组件均可经 CLI 触发，不再只限 Writer）"
 
 echo ""
 echo "PASS: 端到端转换成功，PDF 已生成 (${SIZE} 字节)"
