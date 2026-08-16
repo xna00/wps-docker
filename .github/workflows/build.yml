@@ -1,9 +1,10 @@
 name: build-and-e2e
 
 on:
+  # 只监听 main push（含 release：本地打 tag 后 git push --tags，main+tag 同推，
+  # 由 run 内检测 v* tag 决定是否发布）。不再监听 tag push，避免同提交跑两次 CI。
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -26,7 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       image: ${{ steps.filter.outputs.image }}
-      skip: ${{ steps.tagcheck.outputs.skip }}
+      release: ${{ steps.tagcheck.outputs.release }}
+      tag: ${{ steps.tagcheck.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -51,19 +53,21 @@ jobs:
               - '.github/workflows/**'
               - '.dockerignore'
 
-      # 同一提交 push main + 打 tag 会触发两个 run（main / tag）。
-      # main run 若发现 HEAD 已被 tag 覆盖，直接跳过全部构建——
-      # 完整构建+测试+发布由 tag run 独占执行，避免重复跑一遍 CI。
-      - name: 跳过已被 tag 的 main push（tag run 负责构建+发布）
+      # release 判定：main push 若 HEAD 带 v* tag（本地先打 tag 后 git push --tags 同推）
+      # → release=true 并输出 tag 名，最后一步 publish 据此执行；否则只 build+test 结束。
+      - name: 检测 HEAD 是否带 v* tag（决定是否发布）
         id: tagcheck
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/main')
         run: |
           git fetch --tags --prune --quiet
-          if git tag --points-at "$GITHUB_SHA" | grep -q .; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::HEAD(${GITHUB_SHA:0:7}) 已被 tag 覆盖，本次 run 跳过，由 tag run 完成构建+发布"
+          TAG=$(git tag --points-at "$GITHUB_SHA" | grep -E '^v' | head -1 || true)
+          if [ -n "$TAG" ]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+            echo "::notice::HEAD(${GITHUB_SHA:0:7}) 带 v* tag: ${TAG}，构建测试后发布 Docker Hub"
           else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::HEAD(${GITHUB_SHA:0:7}) 无 v* tag，仅构建+测试"
           fi
 
   # ------------------------------------------------------------------
@@ -71,13 +75,11 @@ jobs:
   # ------------------------------------------------------------------
   build:
     needs: changes
-    # tag 发布 / PR / 手动触发 直接放行；push main 仅镜像相关文件变化才构建
+    # main push 按 paths-filter 判断（仅镜像相关文件变化才构建）；PR / 手动触发直接放行
     if: |
-      needs.changes.outputs.skip != 'true' &&
-      (startsWith(github.ref, 'refs/tags/') ||
-       github.event_name == 'pull_request' ||
-       github.event_name == 'workflow_dispatch' ||
-       needs.changes.outputs.image == 'true')
+      github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch' ||
+      needs.changes.outputs.image == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -130,14 +132,14 @@ jobs:
         run: docker run --rm --entrypoint /bin/bash ${{ env.IMAGE_NAME }}:ci -c "/opt/wpsrpc-rpc/tests/e2e_test.sh"
 
   # ------------------------------------------------------------------
-  # 3) 推送镜像到 Docker Hub（仅打 v* 标签时发布，其余 push/PR 只构建+测试）
-  #    - 打 tag v*（release） → 推 latest + 版本号
-  #    - main run 若 HEAD 已被 tag 覆盖会整体跳过，本 job 只会在 tag run 里执行
+  # 3) 推送镜像到 Docker Hub（run 内检测到 v* tag 才发布）
+  #    - 本地先打 tag → git push --tags（main+tag 同推）→ 本 job 执行：推 latest + 版本号
+  #    - 无 tag 的 main push / PR / 手动触发：不发布，build+test 后结束
   #    需要仓库 Secrets：DOCKERHUB_USERNAME、DOCKERHUB_TOKEN
   # ------------------------------------------------------------------
   push-dockerhub:
     needs: [build, test]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: needs.changes.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -156,9 +158,10 @@ jobs:
       - name: Compute image tags
         id: meta
         run: |
-          # 此 job 仅在 tag 触发，GITHUB_REF_NAME 即 tag 名
+          # 版本号取 run 内检测到的 v* tag 名（本 job 在 main run 中执行，不能再用 GITHUB_REF_NAME）
           REPO="${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}"
-          TAGS="$REPO:latest,$REPO:${GITHUB_REF_NAME}"
+          TAG_NAME="${{ needs.changes.outputs.tag }}"
+          TAGS="$REPO:latest,$REPO:${TAG_NAME}"
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
           echo "将推送: ${TAGS}"
 

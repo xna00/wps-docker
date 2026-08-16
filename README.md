@@ -163,7 +163,21 @@ docker build -f Dockerfile.wps12 -t wps2pdf-wps12 \
 1. **build job**：`docker/build-push-action` 构建镜像（WPS deb 走仓库 Release 附件 CDN，apt/pip 走阿里云），带 `type=gha` 构建缓存
 2. **test job**：`docker run --entrypoint /bin/bash ... e2e_test.sh` 在容器内真跑一次 docx→pdf 转换，断言 PDF 产物存在、>1KB、`%PDF-` 头、页数 ≥ 1
 
-> 仅镜像相关文件变化才触发构建（tag 发布/PR/手动触发无条件）；纯文档改动自动跳过。首次运行约 5–10 分钟（WPS deb ~600MB 拉取 + 构建）；后续命中缓存会显著加快。
+> 仅镜像相关文件变化才触发构建（PR/手动触发无条件）；纯文档改动自动跳过。首次运行约 5–10 分钟（WPS deb ~600MB 拉取 + 构建）；后续命中缓存会显著加快。
+
+### 发布（打 tag）
+
+CI 只监听 main push，一次 push 只跑一次；发布与否由 run 内检测 **HEAD 是否带 `v*` tag** 决定：
+
+```bash
+git commit ...
+git tag v1.4.0          # 本地先打 tag
+git push --tags         # main + tag 同推（一次 push = 一次 CI）
+```
+
+- 带 `v*` tag → build + test 后**追加发布** Docker Hub（`latest` + 版本号两个 tag）；
+- 无 tag → build + test 后结束，不发布；
+- **注意**：不要"先推 main、稍后补 tag"（补 tag 不会触发 CI，会漏发布）；给旧提交补 tag 同理。tag 必须和 main 同推。
 
 ## 目录结构
 
