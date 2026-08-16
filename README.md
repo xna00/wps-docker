@@ -6,14 +6,16 @@
 
 ## 快速开始
 
+> 直接使用 **Docker Hub 发布镜像** [`xna00/wps2pdf`](https://hub.docker.com/r/xna00/wps2pdf)（`latest` 跟随版本更新，无需本地构建），`docker run` 首次运行会自动拉取；也可先 `docker pull xna00/wps2pdf` 显式拉取最新版。
+
 ### 方式一：CLI（一条命令转换）
 
 ```bash
 # 输入/输出挂载到 /data，output.pdf 出现在当前目录
-docker run --rm -v "$PWD":/data wps2pdf input.docx output.pdf
+docker run --rm -v "$PWD":/data xna00/wps2pdf input.docx output.pdf
 
 # 不传参数时默认 /data/input.docx → /data/output.pdf
-docker run --rm -v "$PWD":/data wps2pdf
+docker run --rm -v "$PWD":/data xna00/wps2pdf
 ```
 
 支持格式（按扩展名自动路由到 wps/wpp/et 三组件）：
@@ -28,7 +30,7 @@ docker run --rm -v "$PWD":/data wps2pdf
 
 ```bash
 # 启动（端口默认 8080）
-docker run -d --name wps-api -p 8080:8080 -e MODE=api wps2pdf
+docker run -d --name wps-api -p 8080:8080 -e MODE=api xna00/wps2pdf
 
 # 健康检查
 curl http://localhost:8080/health
@@ -46,6 +48,8 @@ curl -o output.pdf -F "file=@input.docx" http://localhost:8080/convert
 > **仅限内网使用，无鉴权**（如需公网暴露请自行加网关鉴权）。
 
 ## 构建
+
+> 快速开始已直接使用发布镜像，无需构建。以下为**自行构建**场景（离线环境、改字体/依赖、验证 WPS 12 备用镜像等）；本地构建产物把上述命令里的 `xna00/wps2pdf` 换成 `wps2pdf` 即可同样运行。
 
 ```bash
 docker build -t wps2pdf .
@@ -73,7 +77,7 @@ pdfinfo output.pdf        # Creator 应为 "WPS 文字"，Pages 2
 pdftotext output.pdf -    # 中文内容完整
 
 # 端到端自动化测试（生成最小 docx → RPC 转换 → 断言 PDF 产物/页数）
-docker run --rm --entrypoint /bin/bash wps2pdf \
+docker run --rm --entrypoint /bin/bash xna00/wps2pdf \
   -c "/opt/wpsrpc-rpc/tests/e2e_test.sh"
 ```
 
@@ -152,7 +156,7 @@ docker build -f Dockerfile.wps12 -t wps2pdf-wps12 \
 | Noto Sans | 思源黑体 SC | 纯西文名，思源含完整 Latin 字形 |
 | Calibri / Cambria | Carlito / Caladea | apt 安装的度量兼容 OFL 替代（LibreOffice 同款方案） |
 
-> 验证：e2e 测试含"指定微软雅黑 → 嵌入 NotoSansSC 且无 SimSun"断言；也可 `docker run --rm --entrypoint /bin/bash wps2pdf -c 'fc-match 微软雅黑; fc-match Calibri'` 查看映射结果。
+> 验证：e2e 测试含"指定微软雅黑 → 嵌入 NotoSansSC 且无 SimSun"断言；也可 `docker run --rm --entrypoint /bin/bash xna00/wps2pdf -c 'fc-match 微软雅黑; fc-match Calibri'` 查看映射结果。
 
 **如何更新字体**：上游仓库有更新时，重新下载字体 → `tar -cf - 字体目录 | xz -9e > fonts.tar.xz` → 替换本目录文件 → 提交即可。新增缺失字体名映射只需编辑 `fonts_setup.sh` 中的别名 conf 段（第 [4/5] 步 heredoc）。
 
