@@ -171,13 +171,13 @@ CI 只监听 main push，一次 push 只跑一次；发布与否由 run 内检�
 
 ```bash
 git commit ...
-git tag v1.4.0          # 本地先打 tag
-git push --tags         # main + tag 同推（一次 push = 一次 CI）
+git tag v1.5.0          # 本地先打 tag
+git push origin main v1.5.0   # main + tag 显式同推（一次 push = 一次 CI）
 ```
 
 - 带 `v*` tag → build + test 后**追加发布** Docker Hub（`latest` + 版本号两个 tag）；
 - 无 tag → build + test 后结束，不发布；
-- **注意**：不要"先推 main、稍后补 tag"（补 tag 不会触发 CI，会漏发布）；给旧提交补 tag 同理。tag 必须和 main 同推。
+- **注意**：请用上面**显式列出两个 ref** 的写法。实测 `git push --tags` 只推 tag 不推 main——main 不动则 CI 不触发、发布丢失。也不要"先推 main、稍后补 tag"（补 tag 不会触发 CI）；给旧提交补 tag 同理。
 
 ## 目录结构
 
