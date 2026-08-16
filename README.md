@@ -1,5 +1,7 @@
 # pywpsrpc RPC 文档转 PDF 镜像（docx / pptx / xlsx / wps / et …）
 
+[![CI](https://github.com/xna00/wps-docker/actions/workflows/build.yml/badge.svg)](https://github.com/xna00/wps-docker/actions)
+
 用 **WPS 11.1.0.9662 + pywpsrpc v2.4.0 原生 RPC** 将 Office/WPS/ODF 等 **16 种格式**文档转为 PDF 的 Docker 方案。内置 20 个中文字体，支持 CLI 与 HTTP API 两种使用方式。
 
 ## 快速开始
