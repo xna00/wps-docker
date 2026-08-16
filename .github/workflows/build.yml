@@ -33,6 +33,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0   # paths-filter 需要 diff against event.before
+          fetch-tags: true # tag 从 checkout 起就可用（tagcheck 检测 v* tag 用）
       - uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -147,6 +148,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-tags: true   # 让 tag 从 checkout 起就可用
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -160,9 +163,16 @@ jobs:
       - name: Compute image tags
         id: meta
         run: |
-          # 版本号取 run 内检测到的 v* tag 名（本 job 在 main run 中执行，不能再用 GITHUB_REF_NAME）
+          # 自包含：本 job 内重新检测 HEAD 的 v* tag（不依赖跨 job 输出传递），
+          # 未检测到则硬失败，避免发布出空版本号
+          git fetch --tags --prune --quiet
+          TAG_NAME=$(git tag --points-at "$GITHUB_SHA" | grep -E '^v' | head -1 || true)
+          echo "检测到 tag: ${TAG_NAME:-<空>}"
+          if [ -z "$TAG_NAME" ]; then
+            echo "::error::HEAD(${GITHUB_SHA:0:7}) 未检测到 v* tag，拒绝发布"
+            exit 1
+          fi
           REPO="${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}"
-          TAG_NAME="${{ needs.changes.outputs.tag }}"
           TAGS="$REPO:latest,$REPO:${TAG_NAME}"
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
           echo "将推送: ${TAGS}"
