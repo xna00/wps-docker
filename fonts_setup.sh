@@ -3,7 +3,7 @@
 # 字体统一安装脚本：镜像里所有字体相关操作都在这一个文件里
 #   1) apt 安装开源字体包（思源黑体 CJK / 文泉驿 / Carlito·Caladea）
 #   2) 下载并解压常用中文字体包 fonts.tar.xz（宋体/黑体/楷体/仿宋/方正/Times）
-#   3) 用 fonttools 从 NotoSansCJK.ttc 抽 SC 字面 → 独立 NotoSansSC（思源黑体 SC）
+#   3) 下载 Google Fonts 官方 Noto Sans SC 静态 TTF（TrueType，家族名即 "Noto Sans SC"）
 #   4) 写入缺失字体名别名 conf（微软雅黑/等线/Noto Sans/Calibri...→ 已有字体）
 #   5) fc-cache 刷新并打印注册结果
 #
@@ -30,52 +30,34 @@ mkdir -p /usr/share/fonts/wps-office
 python3 -c "import tarfile; tarfile.open('/tmp/fonts.tar.xz').extractall('/usr/share/fonts/wps-office/')"
 rm -f /tmp/fonts.tar.xz
 
-echo "== [3/5] 生成 Noto Sans SC 独立字面（fonttools 抽 SC 面 + 改名）=="
-# 文档（尤其 Google Docs 导出/网页模板）常指定 "Noto Sans SC"，而镜像只有
-# "Noto Sans CJK SC"（.ttc 集合）。直接给 ttc 追加别名时 WPS 会退回 ttc 第 0 面(JP)；
-# 独立单字面文件则无此问题，且家族名精确为 "Noto Sans SC"。
-pip3 install --no-cache-dir --break-system-packages -i https://mirrors.aliyun.com/pypi/simple/ fonttools
-python3 - <<'PY'
-import os
-from fontTools.ttLib import TTFont
-from fontTools.ttLib.ttCollection import TTCollection
-
-FONT_DIR = "/usr/share/fonts/opentype/noto"
-FAMILY = "Noto Sans SC"
-
-def extract_face(ttc_path, out_path, sub):
-    coll = TTCollection(ttc_path)
-    idx = None
-    for i, f in enumerate(coll.fonts):
-        if f["name"].getDebugName(1) == "Noto Sans CJK SC":
-            idx = i
-            break
-    if idx is None:
-        raise SystemExit(f"[noto-sc] ERROR: SC face not found in {ttc_path}")
-    f = TTFont(ttc_path, fontNumber=idx)
-    name = f["name"]
-    for nid in (1, 4, 6, 16, 17):
-        name.removeNames(nameID=nid)
-    ps = f"NotoSansSC-{sub}"
-    name.setName(FAMILY, 1, 3, 1, 0x409)
-    name.setName(FAMILY, 1, 1, 0, 0)
-    name.setName(f"{FAMILY} {sub}", 4, 3, 1, 0x409)
-    name.setName(ps, 6, 3, 1, 0x409)
-    name.setName(ps, 6, 1, 0, 0)
-    name.setName(FAMILY, 16, 3, 1, 0x409)
-    name.setName(sub, 17, 3, 1, 0x409)
-    f.save(out_path)
-    print(f"[noto-sc] {out_path} ({os.path.getsize(out_path)} bytes)")
-
-for sub in ("Regular", "Bold"):
-    ttc = os.path.join(FONT_DIR, f"NotoSansCJK-{sub}.ttc")
-    out = os.path.join(FONT_DIR, f"NotoSansSC-{sub}.otf")
-    if not os.path.exists(ttc):
-        print(f"[noto-sc] skip: {ttc} not found")
-        continue
-    extract_face(ttc, out, sub)
-PY
-pip3 uninstall -y -q --break-system-packages fonttools >/dev/null 2>&1 || true
+echo "== [3/5] 下载 Google Fonts 官方 Noto Sans SC TTF =="
+# 文档（尤其 Google Docs 导出/网页模板）常指定 "Noto Sans SC"，而镜像里只有
+# "Noto Sans CJK SC"（CFF .ttc，WPS 对 CFF 整字嵌入 → PDF 膨胀到 ~28MB）。
+# 官方 Google Fonts 静态 TTF 是 TrueType(glyf)：家族名天生就是 "Noto Sans SC"，
+# 无需转换/改名，且 WPS 对 TrueType 正常子集化（实测 13 页 PPT 输出仅 1.4MB）。
+# 注：fonts.gstatic.com 国内可直接访问；CSS 解析用 fonts.googleapis.com，失败回退 loli 镜像。
+FONT_DIR=/usr/share/fonts/opentype/noto
+mkdir -p "$FONT_DIR"
+for WEIGHT_SPEC in "" ":wght@700"; do
+  if [ "$WEIGHT_SPEC" = ":wght@700" ]; then SUB=Bold; else SUB=Regular; fi
+  # 1) 解析 CSS 拿 ttf 直链（默认 curl UA 返回 ttf 而非 woff2）
+  CSS=""
+  for API in "https://fonts.googleapis.com/css2?family=Noto+Sans+SC${WEIGHT_SPEC}" \
+             "https://fonts.loli.net/css2?family=Noto+Sans+SC${WEIGHT_SPEC}"; do
+    CSS=$(curl -fsSL --max-time 30 "$API" 2>/dev/null || true)
+    [ -n "$CSS" ] && break
+  done
+  URL=$(echo "$CSS" | grep -oE "https://[^)]*\.ttf" | head -1)
+  # 2) 域名统一换回 fonts.gstatic.com（国内直连可用，CI 同样可达）
+  URL=$(echo "$URL" | sed 's|^https://gstatic\.loli\.net|https://fonts.gstatic.com|')
+  if [ -z "$URL" ]; then
+    echo "[noto-sc] ERROR: 无法解析 Noto Sans SC TTF 直链（CSS API 不可达）"
+    exit 1
+  fi
+  # 3) 下载（weight 400 → Regular，700 → Bold）
+  curl -fL --retry 5 --retry-delay 3 -C - -o "$FONT_DIR/NotoSansSC-$SUB.ttf" "$URL"
+  echo "[noto-sc] $FONT_DIR/NotoSansSC-$SUB.ttf ($(stat -c%s "$FONT_DIR/NotoSansSC-$SUB.ttf") bytes)"
+done
 
 echo "== [4/5] 写入缺失字体名别名 conf =="
 # 为什么用 scan 而不是 pattern 别名：WPS 不认 pattern 别名（查询时重定向），

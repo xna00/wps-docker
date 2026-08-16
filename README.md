@@ -141,12 +141,12 @@ docker build -f Dockerfile.wps12 -t wps2pdf-wps12 \
 
 文档（尤其 Google Docs 导出、网页模板、现代 Office）常指定镜像里**不存在的字体名**；WPS 对缺失字体硬编码回落**宋体**（中文）/ URW Bookman（西文），观感差。**所有字体逻辑集中在 `fonts_setup.sh` 一个脚本**（apt 开源字体 + fonts.tar.xz + 思源黑体 SC 生成 + 别名 conf），构建时执行一次，核心两层处理：
 
-1. **Noto Sans SC 独立字面**：用 fonttools 从自带 `NotoSansCJK-*.ttc` 抽取 **SC 字面**（index 2）生成独立 `NotoSansSC-Regular/Bold.otf`（家族名精确为 "Noto Sans SC"）。不用 ttc 集合是为了避免 WPS 加载 .ttc 时退回第 0 面（JP 字面）的问题。
+1. **Noto Sans SC 官方 TTF**：构建时从 Google Fonts 下载官方静态 TrueType 字体（`fonts.gstatic.com` 国内直连可用，CSS 解析失败时回退 loli 镜像），家族名天生即 "Noto Sans SC"，无需转换/改名。选 TrueType 而非 CFF 是关键：**WPS 对 TrueType 正常子集化，对 CFF 整字嵌入**（实测 13 页 PPT：TTF 版 PDF 仅 1.4MB，CFF 版膨胀到 28MB）。
 2. **fontconfig scan 别名**（写入 `/etc/fonts/conf.d/99-font-aliases.conf`）：把常见缺失名字在扫描阶段追加为真实家族名（WPS 只认字体枚举里出现的名字，不认 pattern 别名）：
 
 | 文档指定 | 实际渲染 | 说明 |
 |---|---|---|
-| Noto Sans SC | 思源黑体 SC | 生成的真实家族名 |
+| Noto Sans SC | 思源黑体 SC | Google Fonts 官方 TTF（TrueType，构建时下载） |
 | 微软雅黑 / Microsoft YaHei / Microsoft YaHei UI | 思源黑体 SC | **版权原因不随镜像分发微软雅黑**，用同设计（黑体）映射 |
 | 等线 / DengXian | 思源黑体 SC | Win10/11 Office 中文默认字体 |
 | Noto Sans | 思源黑体 SC | 纯西文名，思源含完整 Latin 字形 |

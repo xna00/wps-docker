@@ -165,6 +165,15 @@ else
     echo "   (pdffonts 未安装，跳过字体断言)"
 fi
 
+# 体积断言：TrueType 字体应被子集化；若 WPS 对 CFF 整字嵌入，PDF 会膨胀到 20MB+
+YAHEI_SIZE=$(stat -c%s "$WORK/yahei.pdf")
+echo "   雅黑测试 PDF 大小: $((YAHEI_SIZE/1024)) KB"
+if [ "$YAHEI_SIZE" -gt $((5 * 1024 * 1024)) ]; then
+    echo "FAIL: 雅黑测试 PDF 超过 5MB（疑似 CFF 字体整字嵌入，未正常子集）"
+    exit 1
+fi
+echo "   体积断言通过（< 5MB，字体正常子集化）"
+
 echo ""
 echo "PASS: 端到端转换成功，PDF 已生成 (${SIZE} 字节)"
 kill "$XPID" 2>/dev/null || true
