@@ -4,8 +4,9 @@
 
 与 convert_docx2pdf.py 的 CLI 逻辑等价，但封装为进程内复用的 RpcEngine：
   - 懒初始化（首次 _ensure 拉起 WPS 进程）
-  - 冷启动串行化：_ensure 用跨进程文件锁 + 错峰，把并发冷启动的 Kingsoft 守护进程
-    争用变成「一次一个」，根治并发 E_FAIL / 永久阻塞（实验一已证实并发冷启动会失败）
+  - 冷启动串行化：_ensure 用跨进程文件锁把并发冷启动的 Kingsoft 守护进程争用变成
+    「一次一个」，根治并发 E_FAIL / 永久阻塞（实验一已证实并发冷启动会失败）；
+    getApplication 是同步 RPC（返回即实例就绪），串行化后无需时间间隔等待
   - warmup 带重试（消除冷启动偶发 E_FAIL 竞态；永久阻塞由 _ensure 内部自杀释放锁兜底）
   - convert 自带一次重建重试（处理转换中途的实例异常）
   - 实例清理：冷启动成功后用「冷启动前后 /proc 快照 diff」认领本 worker 的全部
@@ -29,10 +30,10 @@ os.environ.setdefault("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/runtime-root/d
 # 并错峰 ≥2s，把争用变成「一次一个、互不干扰」。仅真实冷启动（_app is None）才加锁，
 # 复用路径直接返回，零开销。
 COLDSTART_LOCK_PATH = os.environ.get("COLDSTART_LOCK", "/tmp/wps_coldstart.lock")
-# 错峰间隔：锁已保证冷启动串行化，间隔只为给 daemon 留调度缓冲。
-# 实测（12 路压测）：2.0s→27.2s / 1.0s→14.5s / 0.5s→9.6s / 0.2s→5.2s，均 12/12 零异常。
-# 默认 0.5s（2.5 倍余量）；激进可调 0.2s。
-COLDSTART_STAGGER = float(os.environ.get("COLDSTART_STAGGER", "0.5"))
+# 冷启动串行化由文件锁保证；getApplication 是同步 RPC，返回即实例就绪，
+# 无需时间估算等待。实测零间隔（纯锁串行）3 轮 12 路压测 12/12 零异常、墙钟 3.0s。
+# 参数保留仅供极端环境微调，默认 0。
+COLDSTART_STAGGER = float(os.environ.get("COLDSTART_STAGGER", "0"))
 COLDSTART_BUDGET = float(os.environ.get("COLDSTART_BUDGET", "60"))    # 单实例冷启动硬上限（秒）
 
 from pywpsrpc.rpcwpsapi import createWpsRpcInstance, wpsapi
