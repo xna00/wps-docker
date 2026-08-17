@@ -821,3 +821,16 @@ giga.docx（80000 段，单请求 ~26s）并发 4：
 - 入口拒绝名单 REJECTED_EXTS = {odp, ods, uop} → 415 快速拒绝（2ms，不再浪费 worker/超时时间）。
 - 类型不匹配挂死无法入口拦截（扩展名本身合法），保留 TASK_TIMEOUT=180 兜底 + MAX 护栏限流。
 - 删除 ODP_TIMEOUT（odp 不再进转换，专项超时无意义）。
+
+### 补充验证：合法 ODF 文件同样挂死（2026-08-17）
+用标准 ODF 库 odfpy 生成合法完整的 ODS/ODP/ODT（带完整 manifest/styles/master 结构）复测：
+
+| 文件 | 结果 |
+|---|---|
+| odfpy 合法 ODS | 挂死（65s+）——格式本身问题，非文件损坏 |
+| odfpy 合法 ODP | 挂死（65s+）——格式本身问题 |
+| odfpy 合法 ODT | 200 正常（0.6s）——wps 组件的 ODF 文本导入无问题 |
+
+结论：拒绝名单 {odp, ods, uop} 成立——WPS 的 ODF 导入 bug 集中在 wpp（演示）与 et（表格）
+组件，wps（文本）不受影响；odt/uot/uof 保留可转换。
+（测试时 pptx/csv 对照出现的 000 为挂死 worker 占满排队所致，非格式问题。）
