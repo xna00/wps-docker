@@ -29,7 +29,10 @@ os.environ.setdefault("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/runtime-root/d
 # 并错峰 ≥2s，把争用变成「一次一个、互不干扰」。仅真实冷启动（_app is None）才加锁，
 # 复用路径直接返回，零开销。
 COLDSTART_LOCK_PATH = os.environ.get("COLDSTART_LOCK", "/tmp/wps_coldstart.lock")
-COLDSTART_STAGGER = float(os.environ.get("COLDSTART_STAGGER", "2.0"))  # 错峰间隔（秒）
+# 错峰间隔：锁已保证冷启动串行化，间隔只为给 daemon 留调度缓冲。
+# 实测（12 路压测）：2.0s→27.2s / 1.0s→14.5s / 0.5s→9.6s / 0.2s→5.2s，均 12/12 零异常。
+# 默认 0.5s（2.5 倍余量）；激进可调 0.2s。
+COLDSTART_STAGGER = float(os.environ.get("COLDSTART_STAGGER", "0.5"))
 COLDSTART_BUDGET = float(os.environ.get("COLDSTART_BUDGET", "60"))    # 单实例冷启动硬上限（秒）
 
 from pywpsrpc.rpcwpsapi import createWpsRpcInstance, wpsapi
