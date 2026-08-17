@@ -533,24 +533,22 @@ w1/w2（wps，各 22 任务）+ w4（et，首任务注入最小 ODP 触发已知
 
 解决当前单例 API 的三个结构性问题：①不能并发（锁串行化，同一时刻每组件只能转 1 个）②空转吃内存（三组件全启动后约 1.2GB 常驻，零请求也占）③卡死拖垮全局（ODP 死锁只能靠容器级 `timeout` 兜底，且事件循环被同步 RPC pin 死 → daemon 线程超时失效）。
 
-**定位**：单容器、单端口、零外部编排；WPS 实例按配置数常驻复用；顺带根治 API 超时顽疾（主进程事件循环不再被阻塞 RPC 占用）。
+**定位**：单容器、单端口、零外部编排；worker **按需创建、弹性伸缩**（每来一个请求，有同类型空闲 worker 就复用，没有就新建），无预配置容量；顺带根治 API 超时顽疾（主进程事件循环不再被阻塞 RPC 占用）。
 
 ### 架构
 
 ```
 主进程 (FastAPI, async —— 只做 IO 收发，绝不碰 RPC)
-  ├── task_queue      (任务投递: task_id + 文档类型 + 文件路径)
-  ├── result_queue    (回传: task_id + pdf_path / error)
-  └── watchdog        (监控各 worker 心跳, 超时 → kill 进程组 + 重建)
-        │  spawn 子进程（串行, 错开 ≥2s）
+  └── WORKERS: 动态列表 [(pid, type, status, handler)]   # 无预创建, 容量由并发请求驱动
+        │
+        │  每请求: worker = find_idle(type) or create_worker(type)
         ▼
-  Worker1 (子进程, 常驻 wps 实例, 串行处理自己的任务, 定期汇报心跳)
-  Worker2 (子进程, 常驻 wps 实例)
-  Worker3 (子进程, 常驻 wpp 实例)
-  ...
+  Worker(子进程, 持有常驻 wps 实例) —— 处理完本请求后:
+        若有其他同类型 idle → killpg 自杀回收
+        否则                → 转 idle 备用
 ```
 
-**关键约束**：真实 WPS 实例活在 worker 子进程里；主进程 POOL 里的 `handler` 是"逻辑句柄"（队列 + `pid`），**不能**把实例对象直接塞进主进程数组（跨进程不能共享对象）。
+**关键约束**：真实 WPS 实例活在 worker 子进程里；主进程只持"逻辑句柄"（队列 + `pid`），**不能**把实例对象直接塞进主进程（跨进程不能共享对象）。worker 与请求 1:1 绑定、结束后按 spare 策略回收，故**无需 watchdog / 重建 / 固定槽位**。
 
 ### 数据结构
 
@@ -558,75 +556,81 @@ w1/w2（wps，各 22 任务）+ w4（et，首任务注入最小 ODP 触发已知
 class Worker:
     handler:   逻辑句柄 (task_q_in, result_q_out, pid)   # 主进程侧指挥通道
     type:      "wps" | "wpp" | "et"
-    status:    "idle" | "busy" | "dead"                  # dead = 被超时 kill 后等待重建
+    status:    "busy" | "idle"        # idle = 就绪备用; 正在执行本请求时为 busy
     pid:       int     # worker 子进程 pid (killpg 用)
 
-# 配置驱动展开成固定槽位数组（worker 会死、会重建, 槽位/类型恒定）
-WORKER_CONFIG = {"wps": 3, "wpp": 2, "et": 1}   # 共 6 个槽位, 默认建议 wps:2 wpp:1 et:1
-POOL = [Worker(handler=None, type=t, status="idle", pid=None) for t in _expand(WORKER_CONFIG)]
+WORKERS: list[Worker] = []            # 动态列表, 无预创建; 容量完全由并发请求驱动
+SPARE_PER_TYPE: int = 1               # 每类型最多保留几个 idle 备用 (设 0 = 完全不缓存, 来一个建一个)
 ```
+
+> 没有固定槽位数组、没有 `WORKER_CONFIG`、没有 `dead`/重建态——worker 用完即焚或留作备用，容量天然弹性。
 
 ### 状态机
 
 ```
-        init ──(串行拉起成功)──▶ idle ──(领到任务)──▶ busy ──(完成)──▶ idle
-                                     │
-                                     └──(请求超时: asyncio.wait_for)──▶ dead ──(killpg+spawn)──▶ idle
+  (请求到达) ── find_idle(type) ──▶ 复用 idle worker ──┐
+        │                                            │
+        └── create_worker(type) ──▶ busy ──(完成)──┬──┴─▶ 统计同类型 idle 数(不含自己):
+                                                       ≥ SPARE_PER_TYPE → killpg 自杀(回收)
+                                                       否则            → 转 idle 备用
+                    busy ──(请求超时: asyncio.wait_for)──▶ killpg 自杀(不保留)
 ```
 
 - **不用 `heartbeat`**：idle 的 worker 没在跑任务、不会卡死，无需监控；只有 busy 的 worker（被某请求占用）才可能在处理任务时卡死，超时由**该请求自身的定时器**判定，无需全局心跳扫描。
-- 状态由**主进程**统一维护（派发时 `idle→busy`；收结果 `busy→idle`；请求超时 `busy→dead→idle`）。worker 子进程只领任务、回传结果，**不汇报心跳**，逻辑更简单。
-- 超时触发即"请求级"：`await asyncio.wait_for(dispatch(worker, task), timeout=TASK_TIMEOUT)`，事件循环本就在跑，零额外监控成本；超时回调里 `os.killpg(pid, SIGKILL)` 连残留 WPS 一起清，返回该请求超时错误，后台重建 worker。
+- 状态由**主进程**维护（`find_idle` 取出即标记 `busy`；完成 `busy→idle` 或回收；超时 `busy→kill`）。worker 子进程只领任务、回传结果，**不汇报心跳**。
+- 超时触发即"请求级"：`await asyncio.wait_for(dispatch(worker, task), timeout=TASK_TIMEOUT)`，事件循环本就在跑，零额外监控成本；超时回调里 `os.killpg(pid, SIGKILL)` 连残留 WPS 一起清，返回该请求 504，不保留（下次请求重新 `create_worker`）。
 
 ### 关键流程与做法
 
 | 环节 | 做法 |
 |---|---|
-| **构建/启动** | 按 `WORKER_CONFIG` 展开固定槽位数组；worker **串行 spawn，错开 ≥2s**（消冷启动竞态，实验一 5 实例同时起 3/5 失败） |
-| **派发** | 按文档 `type` 找 `status==idle` 的 worker 领任务；同类全忙 → 返回 `429 Too Many Requests` |
+| **派发** | 按 `type` `find_idle`（**原子取出**并立即标记 `busy`，防并发两请求抢同一 worker）；无空闲则 `create_worker` 新建（冷启动，内部带 `ensure_retry` 重试兜底） |
 | **执行** | worker 进程内直接 RPC（单实例 + 进程内锁串行） |
-| **心跳** | worker 处理完（或周期）回报 `heartbeat`；主进程更新 |
-| **卡死/超时** | 请求级 `asyncio.wait_for` 超时 → `os.killpg(pid, SIGKILL)`（连残留 WPS 一起清）→ 返回该请求超时错误 → 后台重建该 worker 放回原槽（类型不变） |
+| **成功回收** | 请求完成 → 统计同类型 `idle` 数（不含自己）；≥ `SPARE_PER_TYPE` 则 `os.killpg(pid)` 回收自身（连残留 WPS 一起清），否则转 `idle` 备用 |
+| **卡死/超时** | 请求级 `asyncio.wait_for` 超时 → `os.killpg(pid)`（连残留 WPS 一起清）→ 返回该请求 504；**不保留**（下次请求重建） |
 | **清理** | **进程组级**（`os.killpg`）——实测 worker 退出后 WPS 实例进程会残留，仅 kill worker 壳清不干净 |
 
-### ⚠️ 已拍板的关键抉择：handler = 常驻活实例，超时单元是 worker 而非每任务
+### ⚠️ 已拍板的关键抉择：handler = 常驻活实例；动态创建 + spare 回收（非固定池）
 
-早期约束写过"每任务子进程 + SIGKILL 超时"。但 **handler 已定为常驻活实例**（跨任务复用，单次走热路径 50–140ms），而常驻实例必须活在 worker 进程内、**无法跨到临时子进程使用**（跨进程连同一全局 WPS 单例会竞态，已验证）。因此：
+- **handler = 常驻活实例**（跨任务复用，单次走热路径 50–140ms），实例活在 worker 进程内、**无法跨到临时子进程使用**（跨进程连同一全局 WPS 单例会竞态，已验证）→ 放弃"每任务临时子进程"。
+- **不再"固定池 + 重建"**：worker **动态创建、用完回收**，无 `WORKER_CONFIG`、无槽位、无重建逻辑。容量为弹性：并发度天然 = 同时到达的请求数，完成后自动收敛到每类型 `SPARE_PER_TYPE` 个 idle 备用。
+- 一次 ODP 卡死 → 只 `kill` 该 worker（请求返回 504），**下次请求重新 `create_worker`**；其他请求/worker 完全不受影响（隔离测试已证 44/44 正常）。
+- 这套模型天然消解了旧 API 超时顽疾：主进程 async 不再被同步 RPC 阻塞，超时交给"请求级 `asyncio.wait_for` 对 worker 进程 `kill`"，而非在事件循环里 `join`；且无需独立 watchdog。
 
-- **放弃"每任务临时子进程"**，改为 **worker 进程级超时 + 重建**。
-- 一次 ODP 卡死 → 重建该 worker（付 ~450ms 冷启动），槽位短暂不可用；**其他 worker 完全不受影响**（隔离测试已证 44/44 正常）。
-- 这套模型天然消解了旧 API 超时顽疾：主进程 async 不再被同步 RPC 阻塞，超时交给 watchdog 对 worker 进程 `kill`，而非在事件循环里 `join`。
+### 超时与复用配置
 
-### 超时配置
-
-| 超时项 | 取值 | 说明 |
+| 配置项 | 取值 | 说明 |
 |---|---|---|
-| 初始化超时 | 60s | 冷启动 `getApplication` 会**永久阻塞**（非返回错误），必须用子进程超时强杀，不能靠 `signal.alarm`（C 扩展 sip 阻塞无法被信号中断） |
+| 初始化超时 | 60s | 冷启动 `getApplication` 会**永久阻塞**（非返回错误），`create_worker` 内必须用子进程超时强杀，不能靠 `signal.alarm`（C 扩展 sip 阻塞无法被信号中断） |
 | 通用任务超时 | 180s | 对齐 CLI 的 `multiprocessing` + SIGKILL 兜底 |
-| ODP 专项超时 | 30s（建议更激进） | ODP 已知必死，缩短触发重建、少占槽位 |
+| ODP 专项超时 | 30s（建议更激进） | ODP 已知必死，缩短触发回收、少留 spare |
 | 超时触发机制 | per-request `asyncio.wait_for` | 无需独立 watchdog / 心跳扫描；仅 busy（被请求占用）worker 可被超时 |
+| 复用策略 `SPARE_PER_TYPE` | 1（环境变量可配） | 每类型最多保留几个 idle 备用；设 0 = 完全不缓存（来一个建一个，空闲零常驻） |
 
 ### 内存预算
 
-N worker ≈ N×0.35GB + 0.1GB 环境（实测：单实例 0.3–0.4GB）。8GB 容器可跑 ~20 worker，12GB 可跑 ~30——并发能力几乎不受内存限制。
+- 单实例 ≈ 0.3–0.4GB（实测：wps 365MB / wpp 311MB）。
+- **空闲（无请求）**：每类型 `SPARE_PER_TYPE×0.35GB`；默认 3 类型 ×1 = **~1GB 常驻**（比当前单例三组件全起 1.2GB 还略低）。设 `SPARE_PER_TYPE=0` → 空闲零常驻。
+- **忙时**：随并发增长（N 并发 ≈ N×0.35GB + spare）。8GB 容器可支撑 ~20 并发，12GB ~30。并发能力几乎不受内存限制。
 
 ### 与现状的衔接（复用，不重写）
 
-- `RpcEngine._ensure / convert / reset` 逻辑直接进 worker 子进程（已是进程内代码）。
-- CLI 的 `multiprocessing` + 超时 SIGKILL 兜底思路 → 复用到 worker 初始化与 watchdog。
-- `http_server.py` 改造：拆成"主进程 FastAPI 调度" + "worker 子进程执行"；`/convert` 改为投递任务、await 结果（async，不再同步阻塞）；`/health` 增加 worker 存活/槽位状态。
+- `RpcEngine._ensure / convert / reset` 逻辑直接进 worker 子进程（已是进程内代码）；`ensure_retry` 重试兜底盘进 `create_worker`。
+- CLI 的 `multiprocessing` + 超时 SIGKILL 兜底思路 → 复用到 `create_worker` 初始化与请求级超时回收。
+- `http_server.py` 改造：主进程 FastAPI + 动态 `WORKERS` 管理（`find_idle`/`create_worker`/回收）+ 请求级 `asyncio.wait_for` 超时；`/convert` 改为取/建 worker、`await` 结果（async，不再同步阻塞）；`/health` 暴露各类型 idle/忙数。
 - `entrypoint.sh` 的 `timeout` 兜底保留（最终防线）。
 
 ### 落地步骤（实现清单）
 
-1. 新增 `worker.py`：worker 子进程（持有 `RpcEngine`，循环 收任务→RPC→回报心跳/结果）。
-2. 改造 `http_server.py`：主进程 FastAPI + POOL 调度 + task/result 队列 + watchdog 协程；`WORKER_CONFIG` 可由环境变量覆盖（默认 `wps:2 wpp:1 et:1`）。
-3. e2e 测试扩展：并发压测（N 任务 × 多类型）+ ODP 隔离（注入死锁验证其他 worker 不受影响）+ worker 重建（kill 后自动补槽）。
-4. README 更新：并发能力说明 + worker 配置项 + 内存/吞吐参考。
+1. 新增 `worker.py`：worker 子进程（持有 `RpcEngine`，循环 收任务→RPC→回报结果）。
+2. 改造 `http_server.py`：主进程 FastAPI + 动态 `WORKERS` 管理（`find_idle` 原子取出 / `create_worker` 带重试 / 成功回收 / 请求级 `asyncio.wait_for` 超时 kill）；`SPARE_PER_TYPE` 环境变量可配（默认 1）。
+3. e2e 测试扩展：并发压测（验证并发 `create_worker` + 完成后收敛到 ≤SPARE_PER_TYPE idle）+ ODP 隔离（注入死锁验证其他请求自动重建不受影响）。
+4. README 更新：并发能力说明 + 复用策略（`SPARE_PER_TYPE`）+ 内存/吞吐参考。
 
 ### 风险与注意
 
-- 冷启动竞态必须串行（实验一教训）——worker 启动错开 ≥2s，重建时同样串行。
+- **取 idle 必须原子**：`find_idle` 取出即标记 `busy`，避免两个并发请求抢到同一个 idle worker。
+- **动态 `create_worker` 的并发冷启动竞态**（实验一 5 同时起 3/5 失败）→ `create_worker` 内部带 `ensure_retry` 重试兜底；可选加"创建信号量"限制同时冷启动数。即便某个冷启动失败也不影响其他请求。
 - 单任务超时必须**进程组级**（wpp 组件 Open docx 等类型不匹配也会永久挂死，不止 ODP）→ 超时兜底覆盖所有任务。
 - 跨进程不能共享 WPS 实例对象——主进程只持逻辑句柄（队列 + pid）。
 - 线程方案不可取：Python 无法强杀线程，卡死线程变僵尸、实例无法回收、残留累积——必须用进程（+ `killpg`）。
@@ -637,4 +641,5 @@ N worker ≈ N×0.35GB + 0.1GB 环境（实测：单实例 0.3–0.4GB）。8GB 
 - handler 语义 = **常驻活实例**（跨任务复用，省冷启动）。
 - 每 worker **独立进程**（OS 级强杀才能干净处理不可逆死锁；线程无法强杀）。
 - Python 不改 Node.js：核心依赖 `pywpsrpc` 是 Python 专属私有 RPC 客户端，Node 无等价物；换语言零收益、高移植风险。
-- 不采用 heartbeat + 独立 watchdog 扫描（2026-08-17 讨论精简）：idle worker 未跑任务不会卡死，只需在 busy（被请求占用）时由该请求的 `asyncio.wait_for` 超时判定 → killpg + 重建。省掉心跳上报与常驻监控，更贴合 async 模型。
+- 不采用 heartbeat + 独立 watchdog 扫描（2026-08-17 讨论精简）：idle worker 未跑任务不会卡死，只需在 busy（被请求占用）时由该请求的 `asyncio.wait_for` 超时判定 → killpg。
+- worker 采用**动态创建 + 每类型最多 1 个 idle 备用**的弹性模型（2026-08-17 重构）：取代固定槽位数组 `WORKER_CONFIG` + 重建逻辑。本质 = 每请求建一个 worker、用完即焚；"复用/留备用"仅为省冷启动的缓存优化，非必需。无预配置容量、无 watchdog、无重建；并发度天然 = 同时到达的请求数，完成后自动收敛到 ≤`SPARE_PER_TYPE` idle/类型。
