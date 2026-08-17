@@ -130,7 +130,8 @@ def _reap_dead():
 
 async def acquire(ext: str) -> Worker:
     """取一个同类型 idle 且存活的 worker 复用（取出即标记 busy 防抢同一实例），
-    否则新建冷启动。该临界区需原子：查找 + 标记 + 新建都在锁内。"""
+    否则新建冷启动。该临界区需原子：查找 + 标记 + 新建都在锁内。
+    注：不做容器预热——池里 idle 都是"用过才释放"的，必然已就绪。"""
     async with _pool_lock:
         _reap_dead()
         for w in WORKERS:
@@ -177,20 +178,6 @@ async def release_or_kill(worker: Worker, ext: str):
             WORKERS.remove(worker)
         else:
             worker.status = "idle"
-
-
-@app.on_event("startup")
-async def on_startup():
-    os.makedirs(WORK, exist_ok=True)
-    # 预热：每类型保留 SPARE_PER_TYPE 个 idle 备用 worker，减少常规负载的冷启动。
-    # warmup 在 worker 进程内异步进行，标记 idle 后立即可被复用（首个任务会等 warmup）。
-    # 错开 2s 创建：避免多个 worker 同时冷启动撞竞态（实验证实并发冷启动有 E_FAIL/挂死风险）。
-    for ext in ("wps", "wpp", "et"):
-        for _ in range(SPARE_PER_TYPE):
-            w = create_worker(ext)
-            w.status = "idle"
-            if SPARE_PER_TYPE > 1 or ext != "et":
-                await asyncio.sleep(2)
 
 
 @app.on_event("shutdown")
