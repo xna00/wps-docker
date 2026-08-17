@@ -108,6 +108,14 @@ class RpcEngine:
             raise RuntimeError(f"{self.name} get集合: 0x{hr & 0xFFFFFFFF:08X}")
         return app, coll, rpc
 
+    def _kill_new_pids(self, baseline):
+        """击杀冷启动期间新出现的 WPS 进程（半成品/实例+stub）。需持冷启动锁。"""
+        for p in set(_list_wps_pids()) - baseline:
+            try:
+                os.kill(p, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
     def _ensure(self):
         if self._app is not None:
             return self._app
@@ -133,20 +141,12 @@ class RpcEngine:
                       f"自杀释放锁", flush=True)
                 # 自杀前清理本次冷启动可能产生的半成品进程（仍在锁内，diff 安全），
                 # 否则 getApplication 阻塞期间拉起的实例会残留为孤儿
-                for p in set(_list_wps_pids()) - baseline:
-                    try:
-                        os.kill(p, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
+                self._kill_new_pids(baseline)
                 os._exit(1)
             if "err" in box:
                 # 失败路径（仍在锁内，串行化保证 diff 安全）：清理本次冷启动产生的
                 # 半成品进程，避免 warmup 失败残留孤儿实例（实测冷启动失败有残留）
-                for p in set(_list_wps_pids()) - baseline:
-                    try:
-                        os.kill(p, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
+                self._kill_new_pids(baseline)
                 raise box["err"]
             app, coll, rpc = box["val"]
             self._app, self._coll, self._rpc = app, coll, rpc

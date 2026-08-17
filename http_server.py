@@ -68,22 +68,32 @@ def _release_slot():
         _sem.release()
 
 
+_POOL_FULL_MSG = f"worker 池已满({MAX_WORKERS})，排队超 {QUEUE_TIMEOUT}s"
+
+
+def _take_idle(ext: str):
+    """取一个同类型 idle 且存活的 worker 并标记 busy；无则 None。调用方需持锁。"""
+    for w in WORKERS:
+        if w.type == ext and w.status == "idle" and w.proc.is_alive():
+            w.status = "busy"
+            return w
+    return None
+
+
 def kill_worker(w: Worker):
     """按记录 PID 杀 WPS 实例 + killpg 杀 worker。
 
     WPS 会 double-fork 守护进程化（实例脱离进程树），killpg 打不到它，
     实例 PID 由 worker 冷启动后记录在 INST_FILE，这里按 PID 精准击杀。"""
+    inst_file = INST_FILE % w.proc.pid
     try:
-        with open(INST_FILE % w.proc.pid) as f:
+        with open(inst_file) as f:
             for p in f.read().split():
                 try:
                     os.kill(int(p), signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
                     pass
-        try:
-            os.remove(INST_FILE % w.proc.pid)
-        except OSError:
-            pass
+        os.remove(inst_file)
     except FileNotFoundError:
         pass
     try:
@@ -123,19 +133,15 @@ async def acquire(ext: str) -> Worker:
     async with _cond:
         while True:
             _reap_dead()
-            for w in WORKERS:
-                if w.type == ext and w.status == "idle" and w.proc.is_alive():
-                    w.status = "busy"
-                    return w
+            if w := _take_idle(ext):
+                return w
             # 无 idle → 拿额度新建（MAX=0 时 _sem 为 None，直接新建）
             if _sem is None or not _sem.locked():
                 if _sem is not None:
                     await _sem.acquire()
-                for w in WORKERS:  # 等待期间可能刚出现 idle，命中则归还额度
-                    if w.type == ext and w.status == "idle" and w.proc.is_alive():
-                        w.status = "busy"
-                        _release_slot()
-                        return w
+                if w := _take_idle(ext):  # 等待期间可能刚出现 idle，命中则归还额度
+                    _release_slot()
+                    return w
                 try:
                     return create_worker(ext)
                 except Exception:
@@ -144,17 +150,11 @@ async def acquire(ext: str) -> Worker:
             # 无 idle 且无额度 → 等 worker 状态变化（带超时）
             remaining = deadline - time.time()
             if remaining <= 0:
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"worker 池已满({MAX_WORKERS})，排队超 {QUEUE_TIMEOUT}s",
-                )
+                raise HTTPException(status_code=503, detail=_POOL_FULL_MSG)
             try:
                 await asyncio.wait_for(_cond.wait(), timeout=remaining)
             except asyncio.TimeoutError:
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"worker 池已满({MAX_WORKERS})，排队超 {QUEUE_TIMEOUT}s",
-                )
+                raise HTTPException(status_code=503, detail=_POOL_FULL_MSG)
 
 
 def _await_result(out_q: multiprocessing.Queue, timeout: int):
@@ -232,6 +232,23 @@ async def health():
             "total": len(WORKERS), "max_workers": MAX_WORKERS}
 
 
+async def _save_upload(file: UploadFile, src: str):
+    """流式写盘 + 边写边限流（避免大文件整份读进内存、超限尽早中断）。"""
+    size = 0
+    with open(src, "wb") as f:
+        while True:
+            chunk = await file.read(1 << 20)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_FILE:
+                raise HTTPException(status_code=413,
+                                    detail=f"文件超过 {MAX_FILE_MB}MB 上限")
+            f.write(chunk)
+    if size == 0:
+        raise HTTPException(status_code=400, detail="空文件")
+
+
 @app.post("/convert")
 async def convert(file: UploadFile = File(...)):
     if not file.filename:
@@ -253,24 +270,11 @@ async def convert(file: UploadFile = File(...)):
     src = os.path.join(workdir, "input" + os.path.splitext(file.filename)[1].lower())
     out = os.path.join(workdir, "output.pdf")
     try:
-        # 流式写盘 + 边写边限流（避免大文件整份读进内存、超限尽早中断）
-        size = 0
-        with open(src, "wb") as f:
-            while True:
-                chunk = await file.read(1 << 20)
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > MAX_FILE:
-                    raise HTTPException(status_code=413,
-                                        detail=f"文件超过 {MAX_FILE_MB}MB 上限")
-                f.write(chunk)
-        if size == 0:
-            raise HTTPException(status_code=400, detail="空文件")
+        await _save_upload(file, src)
 
         timeout = TASK_TIMEOUT
         worker = await acquire(module)
-        ok_holder = {"ok": False}
+        succeeded = False
         try:
             task = {"id": str(uuid.uuid4()), "src": src, "out": out}
             result = await dispatch(worker, task, timeout)
@@ -282,9 +286,9 @@ async def convert(file: UploadFile = File(...)):
                                 f"请改用 .docx/.pptx/.xlsx 等格式",
                     )
                 raise HTTPException(status_code=500, detail=result.get("error", "转换失败"))
-            ok_holder["ok"] = True
             pdf = result["pdf"]
             print(f"[ok] {file.filename} -> {len(pdf)}B", flush=True)
+            succeeded = True
             return Response(
                 content=pdf,
                 media_type="application/pdf",
@@ -295,12 +299,12 @@ async def convert(file: UploadFile = File(...)):
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
         finally:
-            if not ok_holder["ok"]:
+            if succeeded:
+                await release_or_kill(worker, module)
+            else:
                 # 失败（超时/worker 错误）：worker 可能已挂死或实例损坏，干掉
                 kill_worker(worker)
                 await remove_worker(worker)
-            else:
-                await release_or_kill(worker, module)
             shutil.rmtree(workdir, ignore_errors=True)
     except HTTPException:
         raise
