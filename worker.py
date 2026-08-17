@@ -10,15 +10,16 @@
 
 WPS 实例清理（防泄漏）：
   - WPS 会 double-fork 守护进程化，实际 wpsoffice 实例的 ppid 很快变 1（init），
-    既不在 worker 进程树里，也收不到 killpg——因此 worker 在冷启动后把"自己拉起的
-    实例 PID"写入 /tmp/wps_inst_<pid>.txt，并在退出时按记录精准击杀；API 在回收/超时
-    强杀该 worker 时也会读取此文件补刀，确保每次用完即焚、零泄漏。
+    既不在 worker 进程树里，也收不到 killpg——因此 worker 在冷启动后用
+    rpc.getProcessPid() 拿到"自己拉起的实例 PID"，写入 /tmp/wps_inst_<pid>.txt，
+    并在退出时按记录精准击杀；API 在回收/超时强杀该 worker 时也会读取此文件补刀，
+    确保每次用完即焚、零泄漏。
 """
 import os
 import queue
 import multiprocessing
 
-from rpcengine import RpcEngine, kill_subtree
+from rpcengine import RpcEngine
 
 INST_FILE = "/tmp/wps_inst_%d.txt"  # %d = worker pid，记录其 WPS 实例 PID
 
@@ -76,8 +77,8 @@ def worker_main(ext: str, in_q: multiprocessing.Queue, out_q: multiprocessing.Qu
         # 任务后刷新实例 PID 记录（convert 中途重建会换实例）
         _persist_inst(engine)
 
-    # 进程退出：按记录的 PID 精准清理本 worker 的 wpsoffice 残留（WPS 已脱离进程组，
-    # 单纯随进程销毁 / killpg 清不掉，会泄漏 ~380MB/个），再退出自身。
+    # 进程退出：按记录的实例 PID 精准清理本 worker 的 wpsoffice 残留（WPS 已脱离
+    # 进程组，单纯随进程销毁 / killpg 清不掉，会泄漏 ~380MB/个），再退出自身。
     try:
         engine.kill_instances()
     except Exception:
@@ -85,9 +86,5 @@ def worker_main(ext: str, in_q: multiprocessing.Queue, out_q: multiprocessing.Qu
     try:
         os.remove(INST_FILE % os.getpid())
     except OSError:
-        pass
-    try:
-        kill_subtree(os.getpid())
-    except Exception:
         pass
     os._exit(0)

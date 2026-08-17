@@ -8,6 +8,9 @@
     争用变成「一次一个」，根治并发 E_FAIL / 永久阻塞（实验一已证实并发冷启动会失败）
   - warmup 带重试（消除冷启动偶发 E_FAIL 竞态；永久阻塞由 _ensure 内部自杀释放锁兜底）
   - convert 自带一次重建重试（处理转换中途的实例异常）
+  - 实例清理：冷启动成功后用「冷启动前后 /proc 快照 diff」认领本 worker 的全部
+    WPS 进程（主实例 + launcher stub，WPS 会 double-fork 守护进程化、脱离进程树，
+    必须按 PID 清理；实测只杀主实例会漏掉 0MB stub 导致累积）
 """
 import fcntl
 import os
@@ -28,49 +31,6 @@ os.environ.setdefault("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/runtime-root/d
 COLDSTART_LOCK_PATH = os.environ.get("COLDSTART_LOCK", "/tmp/wps_coldstart.lock")
 COLDSTART_STAGGER = float(os.environ.get("COLDSTART_STAGGER", "2.0"))  # 错峰间隔（秒）
 COLDSTART_BUDGET = float(os.environ.get("COLDSTART_BUDGET", "60"))    # 单实例冷启动硬上限（秒）
-
-
-def kill_subtree(root_pid: int):
-    """SIGKILL root_pid 及其全部后代进程（按 /proc ppid 树遍历）。
-
-    关键背景：WPS 启动后会自行 setsid 脱离 worker 进程组（ppid 变 1、独立 pgid），
-    因此单纯 killpg(worker) 清不掉它拉起的 wpsoffice 实例，会泄漏（~380MB/个）。
-    必须在 worker 还活着时按 PID 树收集其全部后代并逐个击杀——无论 WPS 怎么 setsid，
-    只要 worker 还活着，wpsoffice 的 ppid 链仍指向本 worker，即可精准清理。
-    """
-    try:
-        with open("/proc/%d/stat" % root_pid):
-            pass
-    except FileNotFoundError:
-        return
-    children = {}
-    for name in os.listdir("/proc"):
-        if not name.isdigit():
-            continue
-        try:
-            with open("/proc/%s/stat" % name) as f:
-                data = f.read()
-            # stat 第4字段是 ppid；comm 可能含空格/括号，从 ')' 之后切最稳
-            ppid = int(data[data.index(")") + 1:].split()[1])
-        except Exception:
-            continue
-        children.setdefault(ppid, []).append(int(name))
-    stack = [root_pid]
-    seen = set()
-    pids = []
-    while stack:
-        cur = stack.pop()
-        for c in children.get(cur, []):
-            if c not in seen:
-                seen.add(c)
-                pids.append(c)
-                stack.append(c)
-    # 先杀后代，最后杀根（根死后无法再遍历）
-    for p in pids + [root_pid]:
-        try:
-            os.kill(p, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
 
 from pywpsrpc.rpcwpsapi import createWpsRpcInstance, wpsapi
 from pywpsrpc.rpcwppapi import createWppRpcInstance, wppapi
@@ -96,8 +56,9 @@ SUPPORTED_EXTS = sorted(MODULE_BY_EXT)
 
 def _list_wps_pids():
     """列出当前所有 WPS 系列进程 PID（wpsoffice / wps / et / wpp）。
-    用于 worker 冷启动后按 PID 精确认领自己拉起的实例——WPS 会 double-fork 守护进程化，
-    实际实例的 ppid 很快变成 1（init），无法靠进程树反查，只能按 PID 记录。"""
+
+    用于冷启动后 diff 认领本 worker 拉起的全部 WPS 进程（主实例 + launcher stub）。
+    冷启动是全局串行化的（文件锁），快照前后 diff 不会误吞其它 worker 的进程。"""
     pids = []
     for name in os.listdir("/proc"):
         if not name.isdigit():
@@ -119,12 +80,7 @@ class RpcEngine:
         self._app = None
         self._coll = None
         self._rpc = None
-        self._inst_pids = set()  # 本 worker 拉起的 WPS 实例 PID（用于精准清理，防泄漏）
-
-    def _track_instances(self, baseline):
-        """与冷启动前的 WPS PID 集合做差，把本 worker 新拉起的实例 PID 记入 _inst_pids。
-        冷启动是全局串行化的（文件锁），故不会误吞其它 worker 的实例。"""
-        self._inst_pids |= (set(_list_wps_pids()) - baseline)
+        self._inst_pids = set()  # 本 worker 拉起的 WPS 实例 PID（正常单元素，用于精准清理）
 
     def kill_instances(self):
         """按记录的 PID 精准击杀本 worker 的 WPS 实例（WPS 已脱离进程树，必须按 PID）。"""
@@ -195,8 +151,11 @@ class RpcEngine:
                 raise box["err"]
             app, coll, rpc = box["val"]
             self._app, self._coll, self._rpc = app, coll, rpc
-            # 记录本 worker 新拉起的实例 PID（WPS double-fork 到 init，必须按 PID 跟踪清理）
-            self._track_instances(baseline)
+            # 认领本 worker 冷启动期间新出现的全部 WPS 进程（主实例 + launcher stub）。
+            # 实测：只杀主实例（getProcessPid）会漏掉 0MB 的 launcher stub，导致 stub
+            # 随压测累积（76→98+）。diff 在串行化（文件锁）前提下不会误吞其它 worker，
+            # 且天然覆盖 stub + 实例，一并记录、一并清理。
+            self._inst_pids = set(_list_wps_pids()) - baseline
             return self._app
         finally:
             if lockf is not None:

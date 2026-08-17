@@ -29,8 +29,9 @@ docker run --rm -v "$PWD":/data xna00/wps2pdf
 ### 方式二：HTTP API（常驻服务）
 
 ```bash
-# 启动（端口默认 8080）
-docker run -d --name wps-api -p 8080:8080 -e MODE=api xna00/wps2pdf
+# 启动（端口默认 8080）。建议加 --init：tini 作 PID 1 回收 worker 强杀后
+# 残留的 WPS 孤儿/僵尸进程，避免长期运行 PID 槽被耗尽
+docker run -d --init --name wps-api -p 8080:8080 -e MODE=api xna00/wps2pdf
 
 # 健康检查
 curl http://localhost:8080/health

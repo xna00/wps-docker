@@ -693,3 +693,29 @@ WPS 启动后会 **double-fork 守护进程化**：实际 `wpsoffice` 实例的 
 
 结论：单实例 ~0.3–0.4GB；每类型保留 `SPARE_PER_TYPE`(默认1) 个 idle，稳态 ~1.1GB；
 并发冷启动不再泄漏，内存有界、可预测。
+
+## v1.6.1 实例清理简化落地 + 僵尸进程问题（2026-08-17）
+
+### 简化落地（代码净减 45 行）
+按讨论收敛的「核心简化一」重构实例清理：
+- 删除 `kill_subtree`（/proc 进程树遍历）与 `_track_instances`，`kill_worker` 收敛为
+  「读 INST_FILE 杀实例 PID + killpg 杀 worker」。
+- **getProcessPid 单 PID 方案被实测否决**：只杀主实例会漏掉 0MB 的 launcher stub，
+  压测后总进程 76→98 持续累积。正确做法是保留「冷启动前后 /proc 快照 diff」（串行化
+  前提下不会误吞），它天然覆盖主实例 + stub，一并记录一并清理。
+- 最终形态：`_ensure` 内 diff → `_inst_pids`（含实例+stub）→ worker 退出/API 强杀时按集合 kill。
+- 实测：3 轮 12 路压测，实例稳定 4、RSS 稳定 ~1.16GB、3×12 全成功、逻辑池 3 idle/0 dead。
+
+### 僵尸进程问题（实测暴露）
+统计「总进程数（含 0MB）」时发现压测后 7→32→54→76 持续累积——**不是活进程，是 defunct 僵尸**。
+
+| PID 1 是谁 | 僵尸累积 |
+|---|---|
+| `tail -f /dev/null`（测试容器） | 6 → 102+，104 个挂 PID 1 |
+| `python3`（exec，模拟生产） | 6 → 103 —— **CPython 并不会自动 waitpid(-1) reap**，之前"生产无碍"的假设错误 |
+| `docker-init`（tini，`--init`） | **稳定 2**，3 轮压测零累积 |
+
+根因：worker 强杀（SIGKILL）后，其拉起的 WPS launcher/实例 reparent 到容器 PID 1；
+bash/python 都不 reap 孤儿 → 僵尸占 PID 槽无限累积。
+方案：**生产/测试容器统一 `docker run --init`**（tini 作 PID 1，专门 reap 孤儿，
+且不干扰 multiprocessing 对自家 worker 的 join）。README API 启动命令已加 `--init`。
