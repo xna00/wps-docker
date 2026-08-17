@@ -524,3 +524,120 @@ w1/w2（wps，各 22 任务）+ w4（et，首任务注入最小 ODP 触发已知
 - **冷启动使单次请求多花 0.3–0.9s**：常驻热转换 0.05–0.14s，首次冷启动 0.75–0.95s，稳态冷 0.4–0.5s。
 - **对架构选型的影响**：低频/按需场景（如 CLI 每容器转换一次）"用完即焚"完全可接受；高频场景"常驻实例"省下的就是这几百毫秒/请求——当前单例 API 的"常驻不关"设计，收益正是省去这 ~200–450ms 拉起成本。
 - 实测脚本末尾 WPS 进程数累积到 17（每子进程结束未清理残留 WPS 实例，与上面"残留"结论一致）——再次佐证实现需进程组级清理。
+
+---
+
+## 🔧 v1.6.1 Worker 池实现蓝图（讨论定稿 2026-08-17）
+
+### 目标
+
+解决当前单例 API 的三个结构性问题：①不能并发（锁串行化，同一时刻每组件只能转 1 个）②空转吃内存（三组件全启动后约 1.2GB 常驻，零请求也占）③卡死拖垮全局（ODP 死锁只能靠容器级 `timeout` 兜底，且事件循环被同步 RPC pin 死 → daemon 线程超时失效）。
+
+**定位**：单容器、单端口、零外部编排；WPS 实例按配置数常驻复用；顺带根治 API 超时顽疾（主进程事件循环不再被阻塞 RPC 占用）。
+
+### 架构
+
+```
+主进程 (FastAPI, async —— 只做 IO 收发，绝不碰 RPC)
+  ├── task_queue      (任务投递: task_id + 文档类型 + 文件路径)
+  ├── result_queue    (回传: task_id + pdf_path / error)
+  └── watchdog        (监控各 worker 心跳, 超时 → kill 进程组 + 重建)
+        │  spawn 子进程（串行, 错开 ≥2s）
+        ▼
+  Worker1 (子进程, 常驻 wps 实例, 串行处理自己的任务, 定期汇报心跳)
+  Worker2 (子进程, 常驻 wps 实例)
+  Worker3 (子进程, 常驻 wpp 实例)
+  ...
+```
+
+**关键约束**：真实 WPS 实例活在 worker 子进程里；主进程 POOL 里的 `handler` 是"逻辑句柄"（队列 + `pid`），**不能**把实例对象直接塞进主进程数组（跨进程不能共享对象）。
+
+### 数据结构
+
+```python
+class Worker:
+    handler:   逻辑句柄 (task_q_in, result_q_out, pid)   # 主进程侧指挥通道
+    type:      "wps" | "wpp" | "et"
+    status:    "init" | "ready" | "busy" | "dead"
+    heartbeat: float   # 最后活跃时间戳 (unix)
+    pid:       int     # worker 子进程 pid (watchdog kill 用)
+
+# 配置驱动展开成固定槽位数组（worker 会死、会重建, 槽位/类型恒定）
+WORKER_CONFIG = {"wps": 3, "wpp": 2, "et": 1}   # 共 6 个槽位, 默认建议 wps:2 wpp:1 et:1
+POOL = [Worker(handler=None, type=t, status="init", heartbeat=0, pid=None)
+        for t in _expand(WORKER_CONFIG)]
+```
+
+### 状态机
+
+```
+        init ──(串行拉起成功)──▶ ready ──(领到任务)──▶ busy ──(完成)──▶ ready
+                                     │                    │
+                                     │                    └──(超时/卡死)──▶ dead
+                                     │                                         │
+                                     └────────────(watchdog 重建: kill+spawn)──┘
+        dead ──▶ init ──▶ ready
+```
+
+- `status` 是离散枚举（处于哪个阶段）；`heartbeat` 是连续时间戳（最后活跃时刻）。两者配合判死：`status==busy and now-heartbeat > TASK_TIMEOUT` → 卡死。
+- 状态由**主进程**统一维护（派发时 `ready→busy` 并记 `heartbeat`；收结果 `busy→ready`；超时 `busy→dead→init→ready`）。worker 子进程只领任务、汇报心跳、回传结果，不自维护 POOL，避免主从状态不一致。
+
+### 关键流程与做法
+
+| 环节 | 做法 |
+|---|---|
+| **构建/启动** | 按 `WORKER_CONFIG` 展开固定槽位数组；worker **串行 spawn，错开 ≥2s**（消冷启动竞态，实验一 5 实例同时起 3/5 失败） |
+| **派发** | 按文档 `type` 找 `status==ready` 的 worker 领任务；同类全忙 → 队列等待或返回 `429 Too Many Requests` |
+| **执行** | worker 进程内直接 RPC（单实例 + 进程内锁串行） |
+| **心跳** | worker 处理完（或周期）回报 `heartbeat`；主进程更新 |
+| **卡死/超时** | watchdog 看 `heartbeat` 超时 → `os.kill(pgid, SIGKILL)`（连残留 WPS 一起清）→ `status=dead` → 串行重建放回原槽（类型不变） |
+| **清理** | **进程组级**（`os.killpg`）——实测 worker 退出后 WPS 实例进程会残留，仅 kill worker 壳清不干净 |
+
+### ⚠️ 已拍板的关键抉择：handler = 常驻活实例，超时单元是 worker 而非每任务
+
+早期约束写过"每任务子进程 + SIGKILL 超时"。但 **handler 已定为常驻活实例**（跨任务复用，单次走热路径 50–140ms），而常驻实例必须活在 worker 进程内、**无法跨到临时子进程使用**（跨进程连同一全局 WPS 单例会竞态，已验证）。因此：
+
+- **放弃"每任务临时子进程"**，改为 **worker 进程级超时 + 重建**。
+- 一次 ODP 卡死 → 重建该 worker（付 ~450ms 冷启动），槽位短暂不可用；**其他 worker 完全不受影响**（隔离测试已证 44/44 正常）。
+- 这套模型天然消解了旧 API 超时顽疾：主进程 async 不再被同步 RPC 阻塞，超时交给 watchdog 对 worker 进程 `kill`，而非在事件循环里 `join`。
+
+### 超时配置
+
+| 超时项 | 取值 | 说明 |
+|---|---|---|
+| 初始化超时 | 60s | 冷启动 `getApplication` 会**永久阻塞**（非返回错误），必须用子进程超时强杀，不能靠 `signal.alarm`（C 扩展 sip 阻塞无法被信号中断） |
+| 通用任务超时 | 180s | 对齐 CLI 的 `multiprocessing` + SIGKILL 兜底 |
+| ODP 专项超时 | 30s（建议更激进） | ODP 已知必死，缩短触发重建、少占槽位 |
+| watchdog 心跳阈值 | 取任务超时 + 余量 | 仅对 `status==busy` 判定 |
+
+### 内存预算
+
+N worker ≈ N×0.35GB + 0.1GB 环境（实测：单实例 0.3–0.4GB）。8GB 容器可跑 ~20 worker，12GB 可跑 ~30——并发能力几乎不受内存限制。
+
+### 与现状的衔接（复用，不重写）
+
+- `RpcEngine._ensure / convert / reset` 逻辑直接进 worker 子进程（已是进程内代码）。
+- CLI 的 `multiprocessing` + 超时 SIGKILL 兜底思路 → 复用到 worker 初始化与 watchdog。
+- `http_server.py` 改造：拆成"主进程 FastAPI 调度" + "worker 子进程执行"；`/convert` 改为投递任务、await 结果（async，不再同步阻塞）；`/health` 增加 worker 存活/槽位状态。
+- `entrypoint.sh` 的 `timeout` 兜底保留（最终防线）。
+
+### 落地步骤（实现清单）
+
+1. 新增 `worker.py`：worker 子进程（持有 `RpcEngine`，循环 收任务→RPC→回报心跳/结果）。
+2. 改造 `http_server.py`：主进程 FastAPI + POOL 调度 + task/result 队列 + watchdog 协程；`WORKER_CONFIG` 可由环境变量覆盖（默认 `wps:2 wpp:1 et:1`）。
+3. e2e 测试扩展：并发压测（N 任务 × 多类型）+ ODP 隔离（注入死锁验证其他 worker 不受影响）+ worker 重建（kill 后自动补槽）。
+4. README 更新：并发能力说明 + worker 配置项 + 内存/吞吐参考。
+
+### 风险与注意
+
+- 冷启动竞态必须串行（实验一教训）——worker 启动错开 ≥2s，重建时同样串行。
+- 单任务超时必须**进程组级**（wpp 组件 Open docx 等类型不匹配也会永久挂死，不止 ODP）→ 超时兜底覆盖所有任务。
+- 跨进程不能共享 WPS 实例对象——主进程只持逻辑句柄（队列 + pid）。
+- 线程方案不可取：Python 无法强杀线程，卡死线程变僵尸、实例无法回收、残留累积——必须用进程（+ `killpg`）。
+
+### 决策记录（讨论定稿）
+
+- 并发方案选定**自研 worker 池**（非多容器/nginx，非 gunicorn）——理由：多容器/多 worker 的"浪费"在 (N-1)×0.1GB 环境冗余 + 容器/镜像/编排放大；worker 池单容器单端口零编排，且天然根治卡死/超时。
+- handler 语义 = **常驻活实例**（跨任务复用，省冷启动）。
+- 每 worker **独立进程**（OS 级强杀才能干净处理不可逆死锁；线程无法强杀）。
+- Python 不改 Node.js：核心依赖 `pywpsrpc` 是 Python 专属私有 RPC 客户端，Node 无等价物；换语言零收益、高移植风险。
