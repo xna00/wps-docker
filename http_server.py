@@ -35,7 +35,6 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import Response
@@ -161,8 +160,10 @@ async def acquire(ext: str) -> Worker:
                     w.status = "busy"
                     return w
             # 2) 无 idle → 尝试拿额度（非阻塞；没有名额则等待被唤醒）
-            if _sem is not None and not _sem.locked():
-                await _sem.acquire()
+            #    注意 MAX_WORKERS=0（不限制）时 _sem 为 None，直接走"新建"路径。
+            if _sem is None or not _sem.locked():
+                if _sem is not None:
+                    await _sem.acquire()
                 # 拿到额度后再查一次 idle（等待期间可能刚出现空闲 worker，命中则归还额度）
                 for w in WORKERS:
                     if w.type == ext and w.status == "idle" and w.proc.is_alive():
@@ -257,6 +258,8 @@ def _cleanup_atexit():
 async def health():
     async with _pool_lock:
         _reap_dead()
+        # 死 worker 移除释放了额度，通知 acquire 排队者（否则可能白等 503）
+        _cond.notify_all()
         by_type = {}
         for w in WORKERS:
             d = by_type.setdefault(w.type, {"busy": 0, "idle": 0, "dead": 0})

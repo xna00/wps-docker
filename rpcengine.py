@@ -27,7 +27,8 @@ os.environ.setdefault("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/runtime-root/d
 # ---------------------------------------------------------------- 冷启动串行化
 # 多个 worker 进程会并发冷启动（getApplication 连接全局 Kingsoft 守护进程）。
 # 并发争用会触发 E_FAIL / 永久阻塞（实验一已证实），必须以「跨进程文件锁」串行化，
-# 并错峰 ≥2s，把争用变成「一次一个、互不干扰」。仅真实冷启动（_app is None）才加锁，
+# 把争用变成「一次一次、互不干扰」。getApplication 是同步 RPC（返回即实例就绪），
+# 串行化后无需时间间隔（实测零间隔稳定）。仅真实冷启动（_app is None）才加锁，
 # 复用路径直接返回，零开销。
 COLDSTART_LOCK_PATH = os.environ.get("COLDSTART_LOCK", "/tmp/wps_coldstart.lock")
 # 冷启动串行化由文件锁保证；getApplication 是同步 RPC，返回即实例就绪，
