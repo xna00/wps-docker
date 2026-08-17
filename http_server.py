@@ -208,15 +208,6 @@ async def on_shutdown():
     _executor.shutdown(wait=False)
 
 
-@app.on_event("shutdown")
-async def on_shutdown():
-    async with _pool_lock:
-        ws = list(WORKERS)
-    for w in ws:
-        kill_worker(w)
-    _executor.shutdown(wait=False)
-
-
 import atexit
 @atexit.register
 def _cleanup_atexit():

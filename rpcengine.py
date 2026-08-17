@@ -20,7 +20,7 @@ os.environ.setdefault("XDG_RUNTIME_DIR", "/tmp/runtime-root")
 os.environ.setdefault("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/runtime-root/dbus")
 
 COLDSTART_LOCK_PATH = os.environ.get("COLDSTART_LOCK", "/tmp/wps_coldstart.lock")
-COLDSTART_STAGGER = float(os.environ.get("COLDSTART_STAGGER", "0"))    # 极端环境微调用
+COLDSTART_STAGGER = float(os.environ.get("COLDSTART_STAGGER", "0"))    # 极端环境微调
 COLDSTART_BUDGET = float(os.environ.get("COLDSTART_BUDGET", "60"))    # 冷启动硬上限（秒）
 
 from pywpsrpc.rpcwpsapi import createWpsRpcInstance, wpsapi

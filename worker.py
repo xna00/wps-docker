@@ -3,7 +3,7 @@
 """worker 子进程：持有某组件（wps/wpp/et）的常驻 WPS 实例，串行处理自身任务。
 
 主进程通过 in_q 投递任务、out_q 读结果；worker 自成会话（killpg 不误伤主进程）。
-WPS 实例会 double-fork 脱离进程树，故冷启动后用 rpc.getProcessPid() 记录实例 PID
+WPS 实例会 double-fork 脱离进程树，故冷启动后按 /proc 快照 diff 记录实例 PID
 到 INST_FILE，退出/被强杀时按 PID 精准击杀，避免 ~380MB/实例 的泄漏。
 """
 import os
