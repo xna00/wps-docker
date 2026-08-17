@@ -60,7 +60,10 @@ def worker_main(ext: str, in_q: multiprocessing.Queue, out_q: multiprocessing.Qu
                 pdf = f.read()
             out_q.put({"id": task_id, "ok": True, "pdf": pdf, "bytes": len(pdf)})
         except Exception as e:
-            out_q.put({"id": task_id, "ok": False, "error": str(e)})
+            try:
+                out_q.put({"id": task_id, "ok": False, "error": str(e)})
+            except Exception:
+                break  # 主进程已死（BrokenPipe）：退出走实例清理，避免泄漏
         _persist_inst(engine)  # convert 中途重建会换实例，刷新记录
 
     try:

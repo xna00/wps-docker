@@ -133,6 +133,13 @@ class RpcEngine:
                       f"自杀释放锁", flush=True)
                 os._exit(1)
             if "err" in box:
+                # 失败路径（仍在锁内，串行化保证 diff 安全）：清理本次冷启动产生的
+                # 半成品进程，避免 warmup 失败残留孤儿实例（实测冷启动失败有残留）
+                for p in set(_list_wps_pids()) - baseline:
+                    try:
+                        os.kill(p, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
                 raise box["err"]
             app, coll, rpc = box["val"]
             self._app, self._coll, self._rpc = app, coll, rpc

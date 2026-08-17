@@ -6,6 +6,7 @@
 环境变量：HOST/PORT MAX_FILE_MB TASK_TIMEOUT MAX_WORKERS QUEUE_TIMEOUT
 """
 import asyncio
+import atexit
 import multiprocessing
 import os
 import queue
@@ -28,6 +29,7 @@ PORT = int(os.environ.get("PORT", "8080"))
 MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "50"))
 MAX_FILE = MAX_FILE_MB * 1024 * 1024
 WORK = "/tmp/http_conv"
+os.makedirs(WORK, exist_ok=True)
 SPARE_PER_TYPE = 1  # 每类型保留 idle 数：0 崩吞吐、>1 收益低，定死 1
 TASK_TIMEOUT = int(os.environ.get("TASK_TIMEOUT", "180"))  # 转换超时秒（兜底挂死）
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "3"))      # 全局存活 worker 上限，0=不限制
@@ -205,7 +207,6 @@ async def on_shutdown():
     _executor.shutdown(wait=False)
 
 
-import atexit
 @atexit.register
 def _cleanup_atexit():
     for w in list(WORKERS):
@@ -248,19 +249,24 @@ async def convert(file: UploadFile = File(...)):
             detail=f".{ext} 已知无法转换（WPS 导入该格式会挂死），请转存为 docx/pptx/xlsx",
         )
 
-    data = await file.read()
-    if len(data) == 0:
-        raise HTTPException(status_code=400, detail="空文件")
-    if len(data) > MAX_FILE:
-        raise HTTPException(status_code=413, detail=f"文件超过 {MAX_FILE_MB}MB 上限")
-
-    os.makedirs(WORK, exist_ok=True)
     workdir = tempfile.mkdtemp(prefix="conv_", dir=WORK)
     src = os.path.join(workdir, "input" + os.path.splitext(file.filename)[1].lower())
     out = os.path.join(workdir, "output.pdf")
     try:
+        # 流式写盘 + 边写边限流（避免大文件整份读进内存、超限尽早中断）
+        size = 0
         with open(src, "wb") as f:
-            f.write(data)
+            while True:
+                chunk = await file.read(1 << 20)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_FILE:
+                    raise HTTPException(status_code=413,
+                                        detail=f"文件超过 {MAX_FILE_MB}MB 上限")
+                f.write(chunk)
+        if size == 0:
+            raise HTTPException(status_code=400, detail="空文件")
 
         timeout = TASK_TIMEOUT
         worker = await acquire(module)
@@ -272,8 +278,8 @@ async def convert(file: UploadFile = File(...)):
                 if result.get("error") == "WORKER_TIMEOUT":
                     raise HTTPException(
                         status_code=504,
-                        detail=f"转换超时（>{timeout}s），疑似 WPS 无法导出该格式"
-                                f"（已知 .odp 会挂死），请改用 .pptx/.docx/.xlsx 等格式",
+                        detail=f"转换超时（>{timeout}s），疑似 WPS 无法导出该格式，"
+                                f"请改用 .docx/.pptx/.xlsx 等格式",
                     )
                 raise HTTPException(status_code=500, detail=result.get("error", "转换失败"))
             ok_holder["ok"] = True
