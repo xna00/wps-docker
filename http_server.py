@@ -1,172 +1,211 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""pywpsrpc HTTP 转换服务：常驻 WPS 三组件(wps/wpp/et)，POST /convert 上传文档返回 PDF
+"""pywpsrpc HTTP 转换服务（v1.6.1 worker 池架构）
 
-支持格式按「扩展名 -> 组件」路由：
-    wps(Writer):       docx doc wps rtf txt xml html htm mht mhtml odt uot uof dot dotx
-    wpp(Presentation): pptx ppt dps pot potx odp uop pps ppsx
-    et(Spreadsheet):   xlsx xls et csv ods uos xlt xltx ett prn dif
+设计（最终拍板）：
+  - 主进程 FastAPI（async）：只做 IO 收发与调度，绝不碰 RPC。
+  - worker 子进程：持有某组件（wps/wpp/et）的常驻 WPS 实例（handler），
+    单实例串行处理自身任务。每 worker 独立一对队列（in_q/out_q）。
+  - 动态 worker：每来一个请求，acquire 一个 worker（优先复用同类型 idle 实例，
+    否则新建冷启动）；占用即标记 busy，并发度 = idle 数，同类全忙则排到下次。
+  - 请求级超时：主进程阻塞读取 worker 的 out_q（带超时循环），超时即
+    kill 该 worker 整个进程组（连残留 wpsoffice 一起清）→ 返回 504。
+  - 成功回收：检查同类型 idle 数量，≥ SPARE_PER_TYPE 则干掉当前（回收），
+    否则留作 idle 备用。无需 rebuild / 固定容量池 / 独立 watchdog / heartbeat。
 
-说明: 仅限内网使用，无鉴权（如部署到公网请自行加网关/反向代理鉴权）
+环境变量：
+    HOST / PORT        监听地址（默认 0.0.0.0:8080）
+    MAX_FILE_MB        上传大小上限（默认 50MB）
+    SPARE_PER_TYPE     每类型最多保留的 idle 备用 worker 数（默认 1；0 = 空闲零常驻）
+    TASK_TIMEOUT       通用转换超时秒（默认 180）
+    ODP_TIMEOUT        .odp 专项超时秒（已知必挂死，默认 30）
 
-环境变量:
-    HOST / PORT    监听地址（默认 0.0.0.0:8080）
-    MAX_FILE_MB    上传大小上限（默认 50MB）
-
-接口:
-    GET  /health   健康检查（含各组件实例状态）
+接口：
+    GET  /health   健康检查（含各类型 worker 的 busy/idle 计数）
     POST /convert  multipart 上传 file=<文档> → application/pdf
 """
-import os, sys, time, threading, tempfile, shutil
-
-os.environ.setdefault("DISPLAY", ":99")
-os.environ.setdefault("XDG_RUNTIME_DIR", "/tmp/runtime-root")
-os.environ.setdefault("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/runtime-root/dbus")
+import asyncio
+import multiprocessing
+import os
+import queue
+import signal
+import shutil
+import tempfile
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import Response
-from pywpsrpc.rpcwpsapi import createWpsRpcInstance, wpsapi
-from pywpsrpc.rpcwppapi import createWppRpcInstance, wppapi
-from pywpsrpc.rpcetapi import createEtRpcInstance, etapi
-from pywpsrpc.common import S_OK, QtApp
+
+from rpcengine import MODULE_BY_EXT, SUPPORTED_EXTS
+from worker import worker_main
 
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8080"))
 MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "50"))
 MAX_FILE = MAX_FILE_MB * 1024 * 1024
 WORK = "/tmp/http_conv"
+SPARE_PER_TYPE = int(os.environ.get("SPARE_PER_TYPE", "1"))
+TASK_TIMEOUT = int(os.environ.get("TASK_TIMEOUT", "180"))
+ODP_TIMEOUT = int(os.environ.get("ODP_TIMEOUT", "30"))
 
-# ---------------------------------------------------------------- 格式路由
-MODULE_BY_EXT = {
-    # Writer（wpsapi）
-    "docx": "wps", "doc": "wps", "wps": "wps", "rtf": "wps", "txt": "wps",
-    "xml": "wps", "html": "wps", "htm": "wps", "mht": "wps", "mhtml": "wps",
-    "odt": "wps", "uot": "wps", "uof": "wps", "dot": "wps", "dotx": "wps",
-    # Presentation（wppapi）
-    "pptx": "wpp", "ppt": "wpp", "dps": "wpp", "pot": "wpp", "potx": "wpp",
-    "odp": "wpp", "uop": "wpp", "pps": "wpp", "ppsx": "wpp",
-    # Spreadsheet（etapi）
-    "xlsx": "et", "xls": "et", "et": "et", "csv": "et", "ods": "et",
-    "uos": "et", "xlt": "et", "xltx": "et", "ett": "et", "prn": "et", "dif": "et",
-}
-SUPPORTED_EXTS = sorted(MODULE_BY_EXT)
+MP_CTX = multiprocessing.get_context("fork")
+# 阻塞读取 worker out_q 用的线程池（避免阻塞事件循环）；默认转换很快，线程迅速释放
+_executor = ThreadPoolExecutor(max_workers=64, thread_name_prefix="dispatch")
 
-app = FastAPI(title="wps-docx2pdf API", version="1.1")
+app = FastAPI(title="wps-docx2pdf API", version="1.6.1")
 
-# ---------------------------------------------------------------- 组件引擎
-class RpcEngine:
-    """某组件（wps/wpp/et）的全局单例：懒初始化 + 崩溃重建 + 锁串行化"""
 
-    def __init__(self, name):
-        self.name = name
-        self._lock = threading.Lock()
-        self._app = None
-        self._coll = None
-        self._rpc = None
+@dataclass
+class Worker:
+    type: str                       # "wps" | "wpp" | "et"
+    status: str                     # "busy" | "idle"
+    pid: int                        # worker 子进程 pid（killpg 用）
+    in_q: multiprocessing.Queue    # 主->worker 任务投递
+    out_q: multiprocessing.Queue   # worker->主 结果回传
+    proc: multiprocessing.Process
 
-    def _ensure(self):
-        if self._app is not None:
-            return self._app
-        if self.name == "wps":
-            hr, rpc = createWpsRpcInstance()
-        elif self.name == "wpp":
-            hr, rpc = createWppRpcInstance()
+
+WORKERS: list[Worker] = []
+_pool_lock = asyncio.Lock()
+
+
+def task_timeout_for(ext: str) -> int:
+    return ODP_TIMEOUT if ext == "odp" else TASK_TIMEOUT
+
+
+def kill_worker(w: Worker):
+    """kill 整个进程组（worker 壳 + 其拉起的 wpsoffice 残留），连根清掉。"""
+    try:
+        pgid = os.getpgid(w.pid)
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        w.proc.join(3)
+    except Exception:
+        pass
+
+
+def create_worker(ext: str) -> Worker:
+    """新建一个 worker 子进程（status=busy，因 warmup 未完成）。"""
+    in_q = MP_CTX.Queue()
+    out_q = MP_CTX.Queue()
+    p = MP_CTX.Process(target=worker_main, args=(ext, in_q, out_q), daemon=True)
+    p.start()
+    w = Worker(type=ext, status="busy", pid=p.pid, in_q=in_q, out_q=out_q, proc=p)
+    WORKERS.append(w)
+    return w
+
+
+def _reap_dead():
+    """回收已退出（warmup 失败/被杀）的 worker，避免死进程残留在池中。
+    调用方需持有 _pool_lock。"""
+    dead = [w for w in WORKERS if not w.proc.is_alive()]
+    for w in dead:
+        WORKERS.remove(w)
+
+
+async def acquire(ext: str) -> Worker:
+    """取一个同类型 idle 且存活的 worker 复用（取出即标记 busy 防抢同一实例），
+    否则新建冷启动。该临界区需原子：查找 + 标记 + 新建都在锁内。"""
+    async with _pool_lock:
+        _reap_dead()
+        for w in WORKERS:
+            if w.type == ext and w.status == "idle" and w.proc.is_alive():
+                w.status = "busy"
+                return w
+        return create_worker(ext)
+
+
+def _await_result(out_q: multiprocessing.Queue, timeout: int):
+    """在 worker 专用 out_q 上取结果，带超时循环。
+    worker 挂死/崩溃则不返回直到超时；返回 result dict（含 ok/id），永不返回 None。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline + 0.5:
+        try:
+            return out_q.get(timeout=1)
+        except queue.Empty:
+            continue
+    return {"id": None, "ok": False, "error": "WORKER_TIMEOUT"}
+
+
+async def dispatch(worker: Worker, task: dict, timeout: int):
+    loop = asyncio.get_running_loop()
+    worker.in_q.put(task)
+    return await loop.run_in_executor(_executor, _await_result, worker.out_q, timeout)
+
+
+async def remove_worker(w: Worker):
+    async with _pool_lock:
+        if w in WORKERS:
+            WORKERS.remove(w)
+
+
+async def release_or_kill(worker: Worker, ext: str):
+    """成功回收：同类型 idle 且存活数 ≥ SPARE_PER_TYPE 则干掉当前，否则留作 idle 备用。
+    注意：必须只统计存活的 idle（死进程不能当备用），且先回收池中死进程。"""
+    async with _pool_lock:
+        _reap_dead()
+        others = [w for w in WORKERS
+                  if w.type == ext and w.status == "idle" and w.proc.is_alive()
+                  and w is not worker]
+        if len(others) >= SPARE_PER_TYPE:
+            kill_worker(worker)
+            WORKERS.remove(worker)
         else:
-            hr, rpc = createEtRpcInstance()
-        if hr != S_OK:
-            raise RuntimeError(f"{self.name} createRpcInstance: 0x{hr & 0xFFFFFFFF:08X}")
-        rpc.setStartTimeout(15000000)
-        if self.name == "wps":
-            hr, app = rpc.getWpsApplication()
-        elif self.name == "wpp":
-            hr, app = rpc.getWppApplication()
-        else:
-            hr, app = rpc.getEtApplication()
-        if hr != S_OK:
-            raise RuntimeError(f"{self.name} getApplication: 0x{hr & 0xFFFFFFFF:08X}")
-        if self.name == "wps":
-            hr, coll = app.get_Documents()
-        elif self.name == "wpp":
-            hr, coll = app.get_Presentations()
-        else:
-            hr, coll = app.get_Workbooks()
-        if hr != S_OK:
-            raise RuntimeError(f"{self.name} get集合: 0x{hr & 0xFFFFFFFF:08X}")
-        self._app, self._coll, self._rpc = app, coll, rpc
-        return self._app
+            worker.status = "idle"
 
-    def convert(self, src: str, out: str) -> str:
-        """转换一个文档 → pdf（线程安全）"""
-        with self._lock:
-            for attempt in (1, 2):
-                try:
-                    self._ensure()
-                    if self.name == "wps":
-                        hr, doc = self._coll.Open(src)
-                        if hr != S_OK:
-                            raise RuntimeError(f"Open: 0x{hr & 0xFFFFFFFF:08X}")
-                        try:
-                            hr = doc.SaveAs2(out, FileFormat=wpsapi.wdFormatPDF)
-                            if hr != S_OK:
-                                hr = doc.ExportAsFixedFormat(out, wpsapi.wdExportFormatPDF)
-                                if hr != S_OK:
-                                    raise RuntimeError(f"SaveAs2/Export: 0x{hr & 0xFFFFFFFF:08X}")
-                        finally:
-                            try:
-                                doc.Close(False)
-                            except Exception:
-                                pass
-                    elif self.name == "wpp":
-                        hr, pres = self._coll.Open(src)
-                        if hr != S_OK:
-                            raise RuntimeError(f"Open: 0x{hr & 0xFFFFFFFF:08X}")
-                        try:
-                            hr = pres.ExportAsFixedFormat(out, wppapi.ppFixedFormatTypePDF)
-                            if hr != S_OK:
-                                raise RuntimeError(f"ExportAsFixedFormat: 0x{hr & 0xFFFFFFFF:08X}")
-                        finally:
-                            try:
-                                pres.Close()
-                            except Exception:
-                                pass
-                    else:  # et
-                        hr, wb = self._coll.Open(src)
-                        if hr != S_OK:
-                            raise RuntimeError(f"Open: 0x{hr & 0xFFFFFFFF:08X}")
-                        try:
-                            hr = wb.ExportAsFixedFormat(etapi.xlTypePDF, Filename=out)
-                            if hr != S_OK:
-                                raise RuntimeError(f"ExportAsFixedFormat: 0x{hr & 0xFFFFFFFF:08X}")
-                        finally:
-                            try:
-                                wb.Close(False)
-                            except Exception:
-                                pass
-                    if os.path.exists(out) and os.path.getsize(out) > 0:
-                        return out
-                    raise RuntimeError("PDF 未生成或为空")
-                except Exception as e:
-                    if attempt == 1:
-                        print(f"[warn] {self.name} 转换失败(尝试重建): {e}", flush=True)
-                        self.reset()
-                    else:
-                        raise RuntimeError(f"{self.name} 转换失败: {e}") from e
 
-    def reset(self):
-        self._app = None
-        self._coll = None
-        self._rpc = None
+@app.on_event("startup")
+async def on_startup():
+    os.makedirs(WORK, exist_ok=True)
+    # 预热：每类型保留 SPARE_PER_TYPE 个 idle 备用 worker，减少常规负载的冷启动。
+    # warmup 在 worker 进程内异步进行，标记 idle 后立即可被复用（首个任务会等 warmup）。
+    # 错开 2s 创建：避免多个 worker 同时冷启动撞竞态（实验证实并发冷启动有 E_FAIL/挂死风险）。
+    for ext in ("wps", "wpp", "et"):
+        for _ in range(SPARE_PER_TYPE):
+            w = create_worker(ext)
+            w.status = "idle"
+            if SPARE_PER_TYPE > 1 or ext != "et":
+                await asyncio.sleep(2)
 
-    def status(self):
-        return "ready" if self._app is not None else "not_initialized"
 
-engines = {m: RpcEngine(m) for m in ("wps", "wpp", "et")}
+@app.on_event("shutdown")
+async def on_shutdown():
+    async with _pool_lock:
+        ws = list(WORKERS)
+    for w in ws:
+        kill_worker(w)
+    _executor.shutdown(wait=False)
 
-# ---------------------------------------------------------------- 接口
+
+import atexit
+@atexit.register
+def _cleanup_atexit():
+    for w in list(WORKERS):
+        try:
+            os.killpg(os.getpgid(w.pid), signal.SIGKILL)
+        except Exception:
+            pass
+
+
 @app.get("/health")
-def health():
-    return {"status": "ok", "wps": engines["wps"].status(),
-            "wpp": engines["wpp"].status(), "et": engines["et"].status()}
+async def health():
+    async with _pool_lock:
+        _reap_dead()
+        by_type = {}
+        for w in WORKERS:
+            d = by_type.setdefault(w.type, {"busy": 0, "idle": 0, "dead": 0})
+            if not w.proc.is_alive():
+                d["dead"] += 1
+            else:
+                d[w.status] = d.get(w.status, 0) + 1
+    return {"status": "ok", "workers": by_type, "spare_per_type": SPARE_PER_TYPE}
+
 
 @app.post("/convert")
 async def convert(file: UploadFile = File(...)):
@@ -193,24 +232,48 @@ async def convert(file: UploadFile = File(...)):
     try:
         with open(src, "wb") as f:
             f.write(data)
-        t0 = time.time()
-        engines[module].convert(src, out)
-        elapsed = time.time() - t0
-        with open(out, "rb") as f:
-            pdf = f.read()
-        print(f"[ok] {file.filename} -> {len(pdf)}B 耗时{elapsed:.2f}s", flush=True)
-        return Response(
-            content=pdf,
-            media_type="application/pdf",
-            headers={"Content-Disposition": f'attachment; filename="output.pdf"'},
-        )
+
+        timeout = task_timeout_for(ext)
+        worker = await acquire(module)
+        ok_holder = {"ok": False}
+        try:
+            task = {"id": str(uuid.uuid4()), "src": src, "out": out}
+            result = await dispatch(worker, task, timeout)
+            if not result["ok"]:
+                if result.get("error") == "WORKER_TIMEOUT":
+                    raise HTTPException(
+                        status_code=504,
+                        detail=f"转换超时（>{timeout}s），疑似 WPS 无法导出该格式"
+                                f"（已知 .odp 会挂死），请改用 .pptx/.docx/.xlsx 等格式",
+                    )
+                raise HTTPException(status_code=500, detail=result.get("error", "转换失败"))
+            ok_holder["ok"] = True
+            pdf = result["pdf"]
+            print(f"[ok] {file.filename} -> {len(pdf)}B", flush=True)
+            return Response(
+                content=pdf,
+                media_type="application/pdf",
+                headers={"Content-Disposition": 'attachment; filename="output.pdf"'},
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            if not ok_holder["ok"]:
+                # 失败（超时/worker 错误）：本 worker 可能已挂死或实例损坏 -> 干掉
+                kill_worker(worker)
+                await remove_worker(worker)
+            else:
+                # 成功：按 spare 策略保留或回收
+                await release_or_kill(worker, module)
+            shutil.rmtree(workdir, ignore_errors=True)
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[err] {file.filename}: {e}", flush=True)
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
         shutil.rmtree(workdir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
     import uvicorn
