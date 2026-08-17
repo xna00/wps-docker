@@ -2,16 +2,11 @@
 # -*- coding: utf-8 -*-
 """WPS 三组件 RPC 引擎封装（wps/wpp/et），供 worker 子进程使用。
 
-与 convert_docx2pdf.py 的 CLI 逻辑等价，但封装为进程内复用的 RpcEngine：
-  - 懒初始化（首次 _ensure 拉起 WPS 进程）
-  - 冷启动串行化：_ensure 用跨进程文件锁把并发冷启动的 Kingsoft 守护进程争用变成
-    「一次一个」，根治并发 E_FAIL / 永久阻塞（实验一已证实并发冷启动会失败）；
-    getApplication 是同步 RPC（返回即实例就绪），串行化后无需时间间隔等待
-  - warmup 带重试（消除冷启动偶发 E_FAIL 竞态；永久阻塞由 _ensure 内部自杀释放锁兜底）
-  - convert 自带一次重建重试（处理转换中途的实例异常）
-  - 实例清理：冷启动成功后用「冷启动前后 /proc 快照 diff」认领本 worker 的全部
-    WPS 进程（主实例 + launcher stub，WPS 会 double-fork 守护进程化、脱离进程树，
-    必须按 PID 清理；实测只杀主实例会漏掉 0MB stub 导致累积）
+- 冷启动串行化：跨进程文件锁把并发冷启动争用变成「一次一个」
+  （getApplication 是同步 RPC，返回即实例就绪，无需时间间隔）
+- warmup 带重试；getApplication 偶发永久阻塞时线程预算超时自杀释放锁
+- 实例清理：冷启动前后 /proc 快照 diff 认领本 worker 的全部 WPS 进程
+  （主实例 + launcher stub，WPS double-fork 脱离进程树，必须按 PID 清理）
 """
 import fcntl
 import os
@@ -24,18 +19,9 @@ os.environ.setdefault("DISPLAY", ":99")
 os.environ.setdefault("XDG_RUNTIME_DIR", "/tmp/runtime-root")
 os.environ.setdefault("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/runtime-root/dbus")
 
-# ---------------------------------------------------------------- 冷启动串行化
-# 多个 worker 进程会并发冷启动（getApplication 连接全局 Kingsoft 守护进程）。
-# 并发争用会触发 E_FAIL / 永久阻塞（实验一已证实），必须以「跨进程文件锁」串行化，
-# 把争用变成「一次一次、互不干扰」。getApplication 是同步 RPC（返回即实例就绪），
-# 串行化后无需时间间隔（实测零间隔稳定）。仅真实冷启动（_app is None）才加锁，
-# 复用路径直接返回，零开销。
 COLDSTART_LOCK_PATH = os.environ.get("COLDSTART_LOCK", "/tmp/wps_coldstart.lock")
-# 冷启动串行化由文件锁保证；getApplication 是同步 RPC，返回即实例就绪，
-# 无需时间估算等待。实测零间隔（纯锁串行）3 轮 12 路压测 12/12 零异常、墙钟 3.0s。
-# 参数保留仅供极端环境微调，默认 0。
-COLDSTART_STAGGER = float(os.environ.get("COLDSTART_STAGGER", "0"))
-COLDSTART_BUDGET = float(os.environ.get("COLDSTART_BUDGET", "60"))    # 单实例冷启动硬上限（秒）
+COLDSTART_STAGGER = float(os.environ.get("COLDSTART_STAGGER", "0"))    # 极端环境微调用
+COLDSTART_BUDGET = float(os.environ.get("COLDSTART_BUDGET", "60"))    # 冷启动硬上限（秒）
 
 from pywpsrpc.rpcwpsapi import createWpsRpcInstance, wpsapi
 from pywpsrpc.rpcwppapi import createWppRpcInstance, wppapi
@@ -60,10 +46,7 @@ SUPPORTED_EXTS = sorted(MODULE_BY_EXT)
 
 
 def _list_wps_pids():
-    """列出当前所有 WPS 系列进程 PID（wpsoffice / wps / et / wpp）。
-
-    用于冷启动后 diff 认领本 worker 拉起的全部 WPS 进程（主实例 + launcher stub）。
-    冷启动是全局串行化的（文件锁），快照前后 diff 不会误吞其它 worker 的进程。"""
+    """列出所有 WPS 系列进程 PID，供冷启动后 diff 认领（串行化前提下不会误吞）。"""
     pids = []
     for name in os.listdir("/proc"):
         if not name.isdigit():
@@ -85,10 +68,10 @@ class RpcEngine:
         self._app = None
         self._coll = None
         self._rpc = None
-        self._inst_pids = set()  # 本 worker 拉起的 WPS 实例 PID（正常单元素，用于精准清理）
+        self._inst_pids = set()  # 本 worker 拉起的 WPS 实例 PID（正常单元素）
 
     def kill_instances(self):
-        """按记录的 PID 精准击杀本 worker 的 WPS 实例（WPS 已脱离进程树，必须按 PID）。"""
+        """按记录 PID 击杀本 worker 的 WPS 实例（已脱离进程树，必须按 PID）。"""
         for p in list(self._inst_pids):
             try:
                 os.kill(p, signal.SIGKILL)
@@ -97,8 +80,7 @@ class RpcEngine:
         self._inst_pids.clear()
 
     def _create_instance(self):
-        """真正拉起 WPS 实例（createRpcInstance + getApplication + get集合）。
-        仅在持有冷启动锁且已错峰后调用；可能永久阻塞（getApplication 偶发）。"""
+        """拉起 WPS 实例（createRpcInstance + getApplication + get集合）。可能永久阻塞。"""
         if self.name == "wps":
             hr, rpc = createWpsRpcInstance()
         elif self.name == "wpp":
@@ -129,8 +111,7 @@ class RpcEngine:
     def _ensure(self):
         if self._app is not None:
             return self._app
-        # 跨进程串行化冷启动：同一时刻只有一个 worker 在拉起实例，其余排队。
-        # 错峰避免 Kingsoft 守护进程被连续请求冲垮。
+        # 跨进程串行化冷启动：一次一个，避免并发争用 Kingsoft 守护进程
         lockf = None
         try:
             try:
@@ -141,9 +122,8 @@ class RpcEngine:
                       flush=True)
                 lockf = None
             time.sleep(COLDSTART_STAGGER)
-            # getApplication 偶发永久阻塞：用线程 + 预算超时兜底，超时即自杀释放锁，
-            # 避免整把锁被永久占用、拖垮后续所有冷启动。
-            baseline = set(_list_wps_pids())  # 冷启动前已有的 WPS 进程（其它 worker 的）
+            baseline = set(_list_wps_pids())  # 冷启动前已有进程（其它 worker 的）
+            # getApplication 偶发永久阻塞：线程 + 预算超时兜底，超时自杀释放锁
             box = {}
             t = threading.Thread(target=self._run_create, args=(box,), daemon=True)
             t.start()
@@ -156,10 +136,7 @@ class RpcEngine:
                 raise box["err"]
             app, coll, rpc = box["val"]
             self._app, self._coll, self._rpc = app, coll, rpc
-            # 认领本 worker 冷启动期间新出现的全部 WPS 进程（主实例 + launcher stub）。
-            # 实测：只杀主实例（getProcessPid）会漏掉 0MB 的 launcher stub，导致 stub
-            # 随压测累积（76→98+）。diff 在串行化（文件锁）前提下不会误吞其它 worker，
-            # 且天然覆盖 stub + 实例，一并记录、一并清理。
+            # 认领冷启动期间新出现的全部 WPS 进程（实例 + launcher stub，一并清理）
             self._inst_pids = set(_list_wps_pids()) - baseline
             return self._app
         finally:
@@ -180,9 +157,7 @@ class RpcEngine:
             box["err"] = e
 
     def warmup(self, n=3, wait=1.0):
-        """冷启动带重试。_ensure 内部已用跨进程文件锁串行化 + 错峰，消除并发争用；
-        getApplication 偶发 E_FAIL（进程还没就绪）时重试即可救回。若永久阻塞，
-        _ensure 内部会自杀释放锁，由调用方超时 kill 兜底。"""
+        """冷启动带重试（getApplication 偶发 E_FAIL 重试可救）。"""
         last = None
         for _ in range(n):
             try:
