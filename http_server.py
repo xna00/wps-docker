@@ -77,6 +77,10 @@ _pool_lock = asyncio.Lock()
 # 额度信号量：计数 = 还可新建的 worker 数；acquire 新建时消耗、worker 销毁时归还。
 # 语义 = 「池中存活 worker 数 ≤ MAX_WORKERS」。
 _sem = asyncio.Semaphore(MAX_WORKERS) if MAX_WORKERS > 0 else None
+# 条件变量（绑定池锁）：worker 变 idle / 额度释放时 notify，唤醒 acquire 排队者。
+# 必须用它而不是纯信号量——否则 MAX≤SPARE 时唯一 worker 保留 idle 不释放额度，
+# 排队者永远等不到额度（死等 503）。
+_cond = asyncio.Condition(_pool_lock)
 
 
 def _release_slot():
@@ -144,38 +148,46 @@ def _reap_dead():
 
 async def acquire(ext: str) -> Worker:
     """取一个同类型 idle 且存活的 worker 复用（取出即标记 busy 防抢同一实例），
-    否则申请额度并新建冷启动。池满（≥MAX_WORKERS）时排队等额度，QUEUE_TIMEOUT
-    超时抛 503。额度语义 = 池中存活 worker 数 ≤ MAX_WORKERS（idle 复用不新增）。"""
-    # 1) 先找可复用 idle（不消耗新额度）
-    async with _pool_lock:
-        _reap_dead()
-        for w in WORKERS:
-            if w.type == ext and w.status == "idle" and w.proc.is_alive():
-                w.status = "busy"
-                return w
-    # 2) 无 idle → 申请额度（排队，超时 503）
-    if _sem is not None:
-        try:
-            await asyncio.wait_for(_sem.acquire(), timeout=QUEUE_TIMEOUT)
-        except asyncio.TimeoutError:
-            raise HTTPException(
-                status_code=503,
-                detail=f"worker 池已满({MAX_WORKERS})，排队超 {QUEUE_TIMEOUT}s",
-            )
-    # 3) 排队期间可能已有 idle 释放，再查一次（命中则归还刚拿的额度）
-    async with _pool_lock:
-        _reap_dead()
-        for w in WORKERS:
-            if w.type == ext and w.status == "idle" and w.proc.is_alive():
-                w.status = "busy"
-                _release_slot()
-                return w
-        # 4) 新建 worker（消耗额度；失败则归还）
-        try:
-            return create_worker(ext)
-        except Exception:
-            _release_slot()
-            raise
+    否则申请额度并新建冷启动。池满（≥MAX_WORKERS）时在条件变量上排队，
+    worker 变 idle / 额度释放都会被唤醒，QUEUE_TIMEOUT 超时抛 503。
+    额度语义 = 池中存活 worker 数 ≤ MAX_WORKERS（idle 复用不新增）。"""
+    deadline = time.time() + QUEUE_TIMEOUT
+    async with _cond:
+        while True:
+            # 1) 先找可复用 idle（不消耗新额度）
+            _reap_dead()
+            for w in WORKERS:
+                if w.type == ext and w.status == "idle" and w.proc.is_alive():
+                    w.status = "busy"
+                    return w
+            # 2) 无 idle → 尝试拿额度（非阻塞；没有名额则等待被唤醒）
+            if _sem is not None and not _sem.locked():
+                await _sem.acquire()
+                # 拿到额度后再查一次 idle（等待期间可能刚出现空闲 worker，命中则归还额度）
+                for w in WORKERS:
+                    if w.type == ext and w.status == "idle" and w.proc.is_alive():
+                        w.status = "busy"
+                        _release_slot()
+                        return w
+                try:
+                    return create_worker(ext)
+                except Exception:
+                    _release_slot()
+                    raise
+            # 3) 无 idle 且无额度 → 等 worker 状态变化（带超时）
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"worker 池已满({MAX_WORKERS})，排队超 {QUEUE_TIMEOUT}s",
+                )
+            try:
+                await asyncio.wait_for(_cond.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"worker 池已满({MAX_WORKERS})，排队超 {QUEUE_TIMEOUT}s",
+                )
 
 
 def _await_result(out_q: multiprocessing.Queue, timeout: int):
@@ -201,6 +213,7 @@ async def remove_worker(w: Worker):
         if w in WORKERS:
             WORKERS.remove(w)
             _release_slot()
+            _cond.notify_all()
 
 
 async def release_or_kill(worker: Worker, ext: str):
@@ -217,6 +230,8 @@ async def release_or_kill(worker: Worker, ext: str):
             _release_slot()
         else:
             worker.status = "idle"
+        # 唤醒 acquire 排队者（idle 出现或额度释放都可能让其前进）
+        _cond.notify_all()
 
 
 @app.on_event("shutdown")
