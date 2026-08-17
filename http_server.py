@@ -3,7 +3,7 @@
 """pywpsrpc HTTP 转换服务：FastAPI 调度 + worker 子进程池（每进程一个 WPS 实例）。
 
 弹性模型：请求创建 worker → 用完保留 1 个 idle（SPARE 定死 1）→ 超限排队。
-环境变量：HOST/PORT MAX_FILE_MB TASK_TIMEOUT ODP_TIMEOUT MAX_WORKERS QUEUE_TIMEOUT
+环境变量：HOST/PORT MAX_FILE_MB TASK_TIMEOUT MAX_WORKERS QUEUE_TIMEOUT
 """
 import asyncio
 import multiprocessing
@@ -29,10 +29,11 @@ MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "50"))
 MAX_FILE = MAX_FILE_MB * 1024 * 1024
 WORK = "/tmp/http_conv"
 SPARE_PER_TYPE = 1  # 每类型保留 idle 数：0 崩吞吐、>1 收益低，定死 1
-TASK_TIMEOUT = int(os.environ.get("TASK_TIMEOUT", "180"))
-ODP_TIMEOUT = int(os.environ.get("ODP_TIMEOUT", "30"))
+TASK_TIMEOUT = int(os.environ.get("TASK_TIMEOUT", "180"))  # 转换超时秒（兜底挂死）
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "3"))      # 全局存活 worker 上限，0=不限制
 QUEUE_TIMEOUT = int(os.environ.get("QUEUE_TIMEOUT", "60"))  # 池满排队上限，超时 503
+# 已知 WPS 导入挂死的格式（实测 odp/ods 挂死；uop 与 odp 同族高风险），入口直接拒绝
+REJECTED_EXTS = {"odp", "ods", "uop"}
 
 MP_CTX = multiprocessing.get_context("fork")
 # 阻塞读 worker out_q 的线程池（multiprocessing.Queue.get 不能进事件循环）
@@ -63,10 +64,6 @@ def _release_slot():
     """归还一个 worker 额度（worker 销毁/死亡时调用）。"""
     if _sem is not None:
         _sem.release()
-
-
-def task_timeout_for(ext: str) -> int:
-    return ODP_TIMEOUT if ext == "odp" else TASK_TIMEOUT
 
 
 def kill_worker(w: Worker):
@@ -245,6 +242,11 @@ async def convert(file: UploadFile = File(...)):
             status_code=400,
             detail=f"不支持的文件类型 .{ext}，支持: {', '.join(SUPPORTED_EXTS)}",
         )
+    if ext in REJECTED_EXTS:
+        raise HTTPException(
+            status_code=415,
+            detail=f".{ext} 已知无法转换（WPS 导入该格式会挂死），请转存为 docx/pptx/xlsx",
+        )
 
     data = await file.read()
     if len(data) == 0:
@@ -260,7 +262,7 @@ async def convert(file: UploadFile = File(...)):
         with open(src, "wb") as f:
             f.write(data)
 
-        timeout = task_timeout_for(ext)
+        timeout = TASK_TIMEOUT
         worker = await acquire(module)
         ok_holder = {"ok": False}
         try:
