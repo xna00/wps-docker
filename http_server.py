@@ -147,7 +147,18 @@ async def acquire(ext: str) -> Worker:
                 except Exception:
                     _release_slot()
                     raise
-            # 无 idle 且无额度 → 等 worker 状态变化（带超时）
+            # 无 idle 且无额度 → 池满。若额度被他类型 idle 占满（如 3 类型各 1 idle = MAX=3），
+            # 牺牲一个他类型 idle 腾额度（备用缓存可重建，~0.3s 冷启动），否则同类型并发
+            # 请求会被锁死排队（idle 不释放额度，只能等第一个完成 → 假串行）
+            if _sem is not None and _sem.locked():
+                victim = next((w for w in WORKERS
+                               if w.type != ext and w.status == "idle" and w.proc.is_alive()),
+                              None)
+                if victim is not None:
+                    kill_worker(victim)
+                    WORKERS.remove(victim)
+                    _release_slot()
+                    continue
             remaining = deadline - time.time()
             if remaining <= 0:
                 raise HTTPException(status_code=503, detail=_POOL_FULL_MSG)
