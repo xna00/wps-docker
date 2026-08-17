@@ -558,39 +558,35 @@ w1/w2（wps，各 22 任务）+ w4（et，首任务注入最小 ODP 触发已知
 class Worker:
     handler:   逻辑句柄 (task_q_in, result_q_out, pid)   # 主进程侧指挥通道
     type:      "wps" | "wpp" | "et"
-    status:    "init" | "ready" | "busy" | "dead"
-    heartbeat: float   # 最后活跃时间戳 (unix)
-    pid:       int     # worker 子进程 pid (watchdog kill 用)
+    status:    "idle" | "busy" | "dead"                  # dead = 被超时 kill 后等待重建
+    pid:       int     # worker 子进程 pid (killpg 用)
 
 # 配置驱动展开成固定槽位数组（worker 会死、会重建, 槽位/类型恒定）
 WORKER_CONFIG = {"wps": 3, "wpp": 2, "et": 1}   # 共 6 个槽位, 默认建议 wps:2 wpp:1 et:1
-POOL = [Worker(handler=None, type=t, status="init", heartbeat=0, pid=None)
-        for t in _expand(WORKER_CONFIG)]
+POOL = [Worker(handler=None, type=t, status="idle", pid=None) for t in _expand(WORKER_CONFIG)]
 ```
 
 ### 状态机
 
 ```
-        init ──(串行拉起成功)──▶ ready ──(领到任务)──▶ busy ──(完成)──▶ ready
-                                     │                    │
-                                     │                    └──(超时/卡死)──▶ dead
-                                     │                                         │
-                                     └────────────(watchdog 重建: kill+spawn)──┘
-        dead ──▶ init ──▶ ready
+        init ──(串行拉起成功)──▶ idle ──(领到任务)──▶ busy ──(完成)──▶ idle
+                                     │
+                                     └──(请求超时: asyncio.wait_for)──▶ dead ──(killpg+spawn)──▶ idle
 ```
 
-- `status` 是离散枚举（处于哪个阶段）；`heartbeat` 是连续时间戳（最后活跃时刻）。两者配合判死：`status==busy and now-heartbeat > TASK_TIMEOUT` → 卡死。
-- 状态由**主进程**统一维护（派发时 `ready→busy` 并记 `heartbeat`；收结果 `busy→ready`；超时 `busy→dead→init→ready`）。worker 子进程只领任务、汇报心跳、回传结果，不自维护 POOL，避免主从状态不一致。
+- **不用 `heartbeat`**：idle 的 worker 没在跑任务、不会卡死，无需监控；只有 busy 的 worker（被某请求占用）才可能在处理任务时卡死，超时由**该请求自身的定时器**判定，无需全局心跳扫描。
+- 状态由**主进程**统一维护（派发时 `idle→busy`；收结果 `busy→idle`；请求超时 `busy→dead→idle`）。worker 子进程只领任务、回传结果，**不汇报心跳**，逻辑更简单。
+- 超时触发即"请求级"：`await asyncio.wait_for(dispatch(worker, task), timeout=TASK_TIMEOUT)`，事件循环本就在跑，零额外监控成本；超时回调里 `os.killpg(pid, SIGKILL)` 连残留 WPS 一起清，返回该请求超时错误，后台重建 worker。
 
 ### 关键流程与做法
 
 | 环节 | 做法 |
 |---|---|
 | **构建/启动** | 按 `WORKER_CONFIG` 展开固定槽位数组；worker **串行 spawn，错开 ≥2s**（消冷启动竞态，实验一 5 实例同时起 3/5 失败） |
-| **派发** | 按文档 `type` 找 `status==ready` 的 worker 领任务；同类全忙 → 队列等待或返回 `429 Too Many Requests` |
+| **派发** | 按文档 `type` 找 `status==idle` 的 worker 领任务；同类全忙 → 返回 `429 Too Many Requests` |
 | **执行** | worker 进程内直接 RPC（单实例 + 进程内锁串行） |
 | **心跳** | worker 处理完（或周期）回报 `heartbeat`；主进程更新 |
-| **卡死/超时** | watchdog 看 `heartbeat` 超时 → `os.kill(pgid, SIGKILL)`（连残留 WPS 一起清）→ `status=dead` → 串行重建放回原槽（类型不变） |
+| **卡死/超时** | 请求级 `asyncio.wait_for` 超时 → `os.killpg(pid, SIGKILL)`（连残留 WPS 一起清）→ 返回该请求超时错误 → 后台重建该 worker 放回原槽（类型不变） |
 | **清理** | **进程组级**（`os.killpg`）——实测 worker 退出后 WPS 实例进程会残留，仅 kill worker 壳清不干净 |
 
 ### ⚠️ 已拍板的关键抉择：handler = 常驻活实例，超时单元是 worker 而非每任务
@@ -608,7 +604,7 @@ POOL = [Worker(handler=None, type=t, status="init", heartbeat=0, pid=None)
 | 初始化超时 | 60s | 冷启动 `getApplication` 会**永久阻塞**（非返回错误），必须用子进程超时强杀，不能靠 `signal.alarm`（C 扩展 sip 阻塞无法被信号中断） |
 | 通用任务超时 | 180s | 对齐 CLI 的 `multiprocessing` + SIGKILL 兜底 |
 | ODP 专项超时 | 30s（建议更激进） | ODP 已知必死，缩短触发重建、少占槽位 |
-| watchdog 心跳阈值 | 取任务超时 + 余量 | 仅对 `status==busy` 判定 |
+| 超时触发机制 | per-request `asyncio.wait_for` | 无需独立 watchdog / 心跳扫描；仅 busy（被请求占用）worker 可被超时 |
 
 ### 内存预算
 
@@ -641,3 +637,4 @@ N worker ≈ N×0.35GB + 0.1GB 环境（实测：单实例 0.3–0.4GB）。8GB 
 - handler 语义 = **常驻活实例**（跨任务复用，省冷启动）。
 - 每 worker **独立进程**（OS 级强杀才能干净处理不可逆死锁；线程无法强杀）。
 - Python 不改 Node.js：核心依赖 `pywpsrpc` 是 Python 专属私有 RPC 客户端，Node 无等价物；换语言零收益、高移植风险。
+- 不采用 heartbeat + 独立 watchdog 扫描（2026-08-17 讨论精简）：idle worker 未跑任务不会卡死，只需在 busy（被请求占用）时由该请求的 `asyncio.wait_for` 超时判定 → killpg + 重建。省掉心跳上报与常驻监控，更贴合 async 模型。
