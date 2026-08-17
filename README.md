@@ -1,4 +1,4 @@
-# pywpsrpc RPC 文档转 PDF 镜像（docx / pptx / xlsx / wps / et …）
+# wps2pdf：Office / WPS 文档一键转 PDF（Docker 镜像）
 
 [![CI](https://github.com/xna00/wps-docker/actions/workflows/build.yml/badge.svg)](https://github.com/xna00/wps-docker/actions)
 
