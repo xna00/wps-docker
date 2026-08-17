@@ -63,10 +63,9 @@ app = FastAPI(title="wps-docx2pdf API", version="1.6.1")
 class Worker:
     type: str                       # "wps" | "wpp" | "et"
     status: str                     # "busy" | "idle"
-    pid: int                        # worker 子进程 pid（killpg 用）
     in_q: multiprocessing.Queue    # 主->worker 任务投递
     out_q: multiprocessing.Queue   # worker->主 结果回传
-    proc: multiprocessing.Process
+    proc: multiprocessing.Process  # pid 取 w.proc.pid（is_alive/join 用官方封装）
 
 
 WORKERS: list[Worker] = []
@@ -86,21 +85,21 @@ def kill_worker(w: Worker):
     """
     # 1) 按 worker 记录的实例 PID 精准击杀（核心，覆盖 double-fork 的 wpsoffice）
     try:
-        with open(INST_FILE % w.pid) as f:
+        with open(INST_FILE % w.proc.pid) as f:
             for p in f.read().split():
                 try:
                     os.kill(int(p), signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
                     pass
         try:
-            os.remove(INST_FILE % w.pid)
+            os.remove(INST_FILE % w.proc.pid)
         except OSError:
             pass
     except FileNotFoundError:
         pass
     # 2) worker 进程本身（killpg 覆盖其进程组内残留，不误伤 API 主进程）
     try:
-        pgid = os.getpgid(w.pid)
+        pgid = os.getpgid(w.proc.pid)
         os.killpg(pgid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
@@ -116,7 +115,7 @@ def create_worker(ext: str) -> Worker:
     out_q = MP_CTX.Queue()
     p = MP_CTX.Process(target=worker_main, args=(ext, in_q, out_q), daemon=True)
     p.start()
-    w = Worker(type=ext, status="busy", pid=p.pid, in_q=in_q, out_q=out_q, proc=p)
+    w = Worker(type=ext, status="busy", in_q=in_q, out_q=out_q, proc=p)
     WORKERS.append(w)
     return w
 
