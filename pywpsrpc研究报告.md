@@ -663,3 +663,33 @@ SPARE_PER_TYPE: int = 1               # 每类型最多保留几个 idle 备用 
 - **12/12 全部 200，合法 PDF 12/12**；整体墙钟 **25.0s**；最长单请求 ~25s（串行化冷启动的预期上界），不再失控飙升，无失败、无 dead worker。
 - 空闲复用（命中 idle 实例）：docx **0.1s** 秒回；pptx **0.1s**、csv **0.2s** 秒回。
 - 超时设置：API `TASK_TIMEOUT=180s`（请求级）；压测用 `timeout 200s` 整体包裹 + 每请求 `curl --max-time 120`，全程不傻等。
+
+## v1.6.1 WPS 实例内存泄漏修复（2026-08-17）
+
+### 现象（压测暴露）
+12 路并行 docx 压测后，逻辑池仍报 3 idle worker，但容器内 WPS 进程多达 **15–17 个 / 5.3–6.2 GB**，
+且随压测轮次持续增长。每回收一个 worker 就泄漏一个 ~380MB 的 wpsoffice 实例。
+
+### 根因
+WPS 启动后会 **double-fork 守护进程化**：实际 `wpsoffice` 实例的 ppid 很快变成 1（init）、
+并自建独立进程组。因此：
+- `killpg(worker)` 打不到它（不在 worker 进程组）；
+- 基于 ppid 树的 `kill_subtree` 也打不到（它已不在 worker 的进程树里）。
+旧单实例常驻模式从不杀实例，故不漏；新「用完即焚」模型每次回收都漏一个实例。
+
+### 修复
+- `RpcEngine` 冷启动后**按 PID 精确认领**自己拉起的实例：冷启动前快照 WPS PID 集合，拉起后
+  `diff` 得到本 worker 的新实例 PID，存入 `self._inst_pids`（冷启动全局串行化，diff 不会误吞）。
+- worker 把 `self._inst_pids` 落到 `/tmp/wps_inst_<pid>.txt`，并在退出时 `kill_instances()` 按记录击杀。
+- `kill_worker`（API 侧回收/超时强杀）先读该文件按 PID 补刀，再 `kill_subtree`+`killpg` 兜底。
+- `reset()`（convert 中途重建）先 `kill_instances()` 杀旧实例，避免 worker 内累积泄漏。
+
+### 内存实测（wps-test 容器）
+| 状态 | WPS 进程数 | WPS RSS | 逻辑池 |
+|---|---|---|---|
+| 基线（3 idle） | 4（=3 实例，wps 类型含 launcher+wpsoffice 两进程） | ~1.1 GB | 3 idle |
+| 12 路并行压测 ×3 轮 | 稳定 4 | 稳定 ~1.16 GB | 3 idle |
+| 修复前（对照） | 15–17 | 5.3–6.2 GB | 仍 3 idle（泄漏） |
+
+结论：单实例 ~0.3–0.4GB；每类型保留 `SPARE_PER_TYPE`(默认1) 个 idle，稳态 ~1.1GB；
+并发冷启动不再泄漏，内存有界、可预测。

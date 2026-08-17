@@ -11,6 +11,7 @@
 """
 import fcntl
 import os
+import signal
 import threading
 import time
 
@@ -27,6 +28,49 @@ os.environ.setdefault("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/runtime-root/d
 COLDSTART_LOCK_PATH = os.environ.get("COLDSTART_LOCK", "/tmp/wps_coldstart.lock")
 COLDSTART_STAGGER = float(os.environ.get("COLDSTART_STAGGER", "2.0"))  # 错峰间隔（秒）
 COLDSTART_BUDGET = float(os.environ.get("COLDSTART_BUDGET", "60"))    # 单实例冷启动硬上限（秒）
+
+
+def kill_subtree(root_pid: int):
+    """SIGKILL root_pid 及其全部后代进程（按 /proc ppid 树遍历）。
+
+    关键背景：WPS 启动后会自行 setsid 脱离 worker 进程组（ppid 变 1、独立 pgid），
+    因此单纯 killpg(worker) 清不掉它拉起的 wpsoffice 实例，会泄漏（~380MB/个）。
+    必须在 worker 还活着时按 PID 树收集其全部后代并逐个击杀——无论 WPS 怎么 setsid，
+    只要 worker 还活着，wpsoffice 的 ppid 链仍指向本 worker，即可精准清理。
+    """
+    try:
+        with open("/proc/%d/stat" % root_pid):
+            pass
+    except FileNotFoundError:
+        return
+    children = {}
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/%s/stat" % name) as f:
+                data = f.read()
+            # stat 第4字段是 ppid；comm 可能含空格/括号，从 ')' 之后切最稳
+            ppid = int(data[data.index(")") + 1:].split()[1])
+        except Exception:
+            continue
+        children.setdefault(ppid, []).append(int(name))
+    stack = [root_pid]
+    seen = set()
+    pids = []
+    while stack:
+        cur = stack.pop()
+        for c in children.get(cur, []):
+            if c not in seen:
+                seen.add(c)
+                pids.append(c)
+                stack.append(c)
+    # 先杀后代，最后杀根（根死后无法再遍历）
+    for p in pids + [root_pid]:
+        try:
+            os.kill(p, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
 
 from pywpsrpc.rpcwpsapi import createWpsRpcInstance, wpsapi
 from pywpsrpc.rpcwppapi import createWppRpcInstance, wppapi
@@ -50,6 +94,23 @@ MODULE_BY_EXT = {
 SUPPORTED_EXTS = sorted(MODULE_BY_EXT)
 
 
+def _list_wps_pids():
+    """列出当前所有 WPS 系列进程 PID（wpsoffice / wps / et / wpp）。
+    用于 worker 冷启动后按 PID 精确认领自己拉起的实例——WPS 会 double-fork 守护进程化，
+    实际实例的 ppid 很快变成 1（init），无法靠进程树反查，只能按 PID 记录。"""
+    pids = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            comm = open("/proc/%s/comm" % name).read().strip()
+        except Exception:
+            continue
+        if comm in ("wpsoffice", "wps", "et", "wpp"):
+            pids.append(int(name))
+    return pids
+
+
 class RpcEngine:
     """某组件（wps/wpp/et）的引擎：进程内单实例复用（一个 worker 持一个实例）。"""
 
@@ -58,6 +119,21 @@ class RpcEngine:
         self._app = None
         self._coll = None
         self._rpc = None
+        self._inst_pids = set()  # 本 worker 拉起的 WPS 实例 PID（用于精准清理，防泄漏）
+
+    def _track_instances(self, baseline):
+        """与冷启动前的 WPS PID 集合做差，把本 worker 新拉起的实例 PID 记入 _inst_pids。
+        冷启动是全局串行化的（文件锁），故不会误吞其它 worker 的实例。"""
+        self._inst_pids |= (set(_list_wps_pids()) - baseline)
+
+    def kill_instances(self):
+        """按记录的 PID 精准击杀本 worker 的 WPS 实例（WPS 已脱离进程树，必须按 PID）。"""
+        for p in list(self._inst_pids):
+            try:
+                os.kill(p, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        self._inst_pids.clear()
 
     def _create_instance(self):
         """真正拉起 WPS 实例（createRpcInstance + getApplication + get集合）。
@@ -106,6 +182,7 @@ class RpcEngine:
             time.sleep(COLDSTART_STAGGER)
             # getApplication 偶发永久阻塞：用线程 + 预算超时兜底，超时即自杀释放锁，
             # 避免整把锁被永久占用、拖垮后续所有冷启动。
+            baseline = set(_list_wps_pids())  # 冷启动前已有的 WPS 进程（其它 worker 的）
             box = {}
             t = threading.Thread(target=self._run_create, args=(box,), daemon=True)
             t.start()
@@ -118,6 +195,8 @@ class RpcEngine:
                 raise box["err"]
             app, coll, rpc = box["val"]
             self._app, self._coll, self._rpc = app, coll, rpc
+            # 记录本 worker 新拉起的实例 PID（WPS double-fork 到 init，必须按 PID 跟踪清理）
+            self._track_instances(baseline)
             return self._app
         finally:
             if lockf is not None:
@@ -207,6 +286,7 @@ class RpcEngine:
                     raise RuntimeError(f"{self.name} 转换失败: {e}") from e
 
     def reset(self):
+        self.kill_instances()  # 先按 PID 杀掉旧实例，避免重建时泄漏
         self._app = None
         self._coll = None
         self._rpc = None

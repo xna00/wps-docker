@@ -40,8 +40,8 @@ from typing import Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import Response
 
-from rpcengine import MODULE_BY_EXT, SUPPORTED_EXTS
-from worker import worker_main
+from rpcengine import MODULE_BY_EXT, SUPPORTED_EXTS, kill_subtree
+from worker import worker_main, INST_FILE
 
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -78,7 +78,28 @@ def task_timeout_for(ext: str) -> int:
 
 
 def kill_worker(w: Worker):
-    """kill 整个进程组（worker 壳 + 其拉起的 wpsoffice 残留），连根清掉。"""
+    """精准清理一个 worker：杀掉它及其拉起的 wpsoffice 残留（防内存泄漏）。
+
+    关键：WPS 会 double-fork 守护进程化，实际实例 ppid 变 1、脱离进程树，
+    killpg / PID 树遍历都打不到。worker 在冷启动后把"自己的实例 PID"写入
+    INST_FILE，这里先按文件记录的 PID 补刀，再 killpg / kill_subtree 兜底。
+    """
+    # 1) 按 worker 记录的实例 PID 精准击杀（核心，覆盖 double-fork 的 wpsoffice）
+    try:
+        with open(INST_FILE % w.pid) as f:
+            for p in f.read().split():
+                try:
+                    os.kill(int(p), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        try:
+            os.remove(INST_FILE % w.pid)
+        except OSError:
+            pass
+    except FileNotFoundError:
+        pass
+    # 2) 兜底：进程树 + 进程组级强杀（覆盖仍挂在 worker 树下的 launcher）
+    kill_subtree(w.pid)
     try:
         pgid = os.getpgid(w.pid)
         os.killpg(pgid, signal.SIGKILL)
@@ -188,7 +209,7 @@ import atexit
 def _cleanup_atexit():
     for w in list(WORKERS):
         try:
-            os.killpg(os.getpgid(w.pid), signal.SIGKILL)
+            kill_subtree(w.pid)
         except Exception:
             pass
 
