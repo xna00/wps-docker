@@ -10,13 +10,13 @@
     否则新建冷启动）；占用即标记 busy，并发度 = idle 数，同类全忙则排到下次。
   - 请求级超时：主进程阻塞读取 worker 的 out_q（带超时循环），超时即
     kill 该 worker 整个进程组（连残留 wpsoffice 一起清）→ 返回 504。
-  - 成功回收：检查同类型 idle 数量，≥ SPARE_PER_TYPE 则干掉当前（回收），
-    否则留作 idle 备用。无需 rebuild / 固定容量池 / 独立 watchdog / heartbeat。
+  - 成功回收：同类型已有 idle 备用则干掉当前（回收），否则留作 idle 备用。
+    备用数定死为 1（实测：0 会让持续负载每个请求冷启动、吞吐崩 2.7 倍；>1 收益 ~10%
+    内存却翻倍——1 是唯一合理值，故不做配置）。无需 rebuild / watchdog / heartbeat。
 
 环境变量：
     HOST / PORT        监听地址（默认 0.0.0.0:8080）
     MAX_FILE_MB        上传大小上限（默认 50MB）
-    SPARE_PER_TYPE     每类型最多保留的 idle 备用 worker 数（默认 1；0 = 空闲零常驻）
     TASK_TIMEOUT       通用转换超时秒（默认 180）
     ODP_TIMEOUT        .odp 专项超时秒（已知必挂死，默认 30）
 
@@ -48,7 +48,7 @@ PORT = int(os.environ.get("PORT", "8080"))
 MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "50"))
 MAX_FILE = MAX_FILE_MB * 1024 * 1024
 WORK = "/tmp/http_conv"
-SPARE_PER_TYPE = int(os.environ.get("SPARE_PER_TYPE", "1"))
+SPARE_PER_TYPE = 1  # 每类型保留的 idle 备用数，定死 1（0 崩吞吐、>1 收益低，详见模块注释）
 TASK_TIMEOUT = int(os.environ.get("TASK_TIMEOUT", "180"))
 ODP_TIMEOUT = int(os.environ.get("ODP_TIMEOUT", "30"))
 # 全局最大存活 worker 数（含 idle 备用）——内存预算护栏，防突发并发打爆内存。
@@ -217,14 +217,14 @@ async def remove_worker(w: Worker):
 
 
 async def release_or_kill(worker: Worker, ext: str):
-    """成功回收：同类型 idle 且存活数 ≥ SPARE_PER_TYPE 则干掉当前，否则留作 idle 备用。
+    """成功回收：同类型已有 idle 备用（存活）则干掉当前，否则留作 idle 备用。
     注意：必须只统计存活的 idle（死进程不能当备用），且先回收池中死进程。"""
     async with _pool_lock:
         _reap_dead()
         others = [w for w in WORKERS
                   if w.type == ext and w.status == "idle" and w.proc.is_alive()
                   and w is not worker]
-        if len(others) >= SPARE_PER_TYPE:
+        if others:
             kill_worker(worker)
             WORKERS.remove(worker)
             _release_slot()
@@ -264,7 +264,7 @@ async def health():
                 d["dead"] += 1
             else:
                 d[w.status] = d.get(w.status, 0) + 1
-    return {"status": "ok", "workers": by_type, "spare_per_type": SPARE_PER_TYPE,
+    return {"status": "ok", "workers": by_type,
             "total": len(WORKERS), "max_workers": MAX_WORKERS}
 
 
