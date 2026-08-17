@@ -41,7 +41,7 @@ MP_CTX = multiprocessing.get_context("fork")
 # 阻塞读 worker out_q 的线程池（multiprocessing.Queue.get 不能进事件循环）
 _executor = ThreadPoolExecutor(max_workers=64, thread_name_prefix="dispatch")
 
-app = FastAPI(title="wps-docx2pdf API", version="1.6.1")
+app = FastAPI(title="wps-docx2pdf API", version="1.7.0")
 
 
 @dataclass
