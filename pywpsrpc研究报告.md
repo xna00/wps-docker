@@ -643,3 +643,23 @@ SPARE_PER_TYPE: int = 1               # 每类型最多保留几个 idle 备用 
 - Python 不改 Node.js：核心依赖 `pywpsrpc` 是 Python 专属私有 RPC 客户端，Node 无等价物；换语言零收益、高移植风险。
 - 不采用 heartbeat + 独立 watchdog 扫描（2026-08-17 讨论精简）：idle worker 未跑任务不会卡死，只需在 busy（被请求占用）时由该请求的 `asyncio.wait_for` 超时判定 → killpg。
 - worker 采用**动态创建 + 每类型最多 1 个 idle 备用**的弹性模型（2026-08-17 重构）：取代固定槽位数组 `WORKER_CONFIG` + 重建逻辑。本质 = 每请求建一个 worker、用完即焚；"复用/留备用"仅为省冷启动的缓存优化，非必需。无预配置容量、无 watchdog、无重建；并发度天然 = 同时到达的请求数，完成后自动收敛到 ≤`SPARE_PER_TYPE` idle/类型。
+
+## v1.6.1 并发冷启动竞态修复（2026-08-17）
+
+### 现象
+弹性模型下，12 路并行 docx 首次请求同时 `create_worker` → 12 个 worker 进程同时 `warmup()` → 同时 `getApplication` 争用全局 Kingsoft 守护进程，耗时阶梯式飙升（17s→33s→49s→69s 且继续），印证实验一「多实例并发冷启动失败」。
+
+### 根因
+`worker` 是独立进程，跨进程无协调；`getApplication` 连接全局 Kingsoft 守护进程，并发争用会触发 `E_FAIL` / 永久阻塞（实验一已证实），而非单纯变慢。
+
+### 修复（`rpcengine.py`）
+- `_ensure` 在真实冷启动（`self._app is None`）时获取**跨进程文件锁**（`fcntl.flock`，锁文件 `/tmp/wps_coldstart.lock`）串行化，把「N 个并发争用」变成「一次一个、互不干扰」。
+- 持锁后 `sleep(COLDSTART_STAGGER)`（默认 **2.0s**，可调）错峰，规避守护进程被连续请求冲垮。
+- 永久阻塞兜底：实例创建在守护线程中跑，`join(COLDSTART_BUDGET)`（默认 **60s**）超时即 `os._exit(1)` 自杀，**释放文件锁**，避免整把锁被永久占用拖垮后续所有冷启动（父进程随后超时清理该 worker）。
+- 复用路径（`_app` 已存在）直接返回，**零开销、不加锁**。
+- 新增环境变量：`COLDSTART_STAGGER` / `COLDSTART_BUDGET` / `COLDSTART_LOCK`。
+
+### 测试结果（wps-test 容器，12 路并行 docx）
+- **12/12 全部 200，合法 PDF 12/12**；整体墙钟 **25.0s**；最长单请求 ~25s（串行化冷启动的预期上界），不再失控飙升，无失败、无 dead worker。
+- 空闲复用（命中 idle 实例）：docx **0.1s** 秒回；pptx **0.1s**、csv **0.2s** 秒回。
+- 超时设置：API `TASK_TIMEOUT=180s`（请求级）；压测用 `timeout 200s` 整体包裹 + 每请求 `curl --max-time 120`，全程不傻等。
