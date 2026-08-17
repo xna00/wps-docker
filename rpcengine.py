@@ -131,6 +131,13 @@ class RpcEngine:
             if t.is_alive():
                 print(f"[fatal] {self.name} 冷启动永久阻塞（>{COLDSTART_BUDGET:.0f}s），"
                       f"自杀释放锁", flush=True)
+                # 自杀前清理本次冷启动可能产生的半成品进程（仍在锁内，diff 安全），
+                # 否则 getApplication 阻塞期间拉起的实例会残留为孤儿
+                for p in set(_list_wps_pids()) - baseline:
+                    try:
+                        os.kill(p, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
                 os._exit(1)
             if "err" in box:
                 # 失败路径（仍在锁内，串行化保证 diff 安全）：清理本次冷启动产生的
