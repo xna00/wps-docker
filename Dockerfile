@@ -178,7 +178,7 @@ RUN chmod +x /usr/local/bin/gsettings
 # --- 拷贝 pywpsrpc + 修复库 + 转换脚本 ---
 COPY --from=builder /usr/local/lib/python3.12/dist-packages/pywpsrpc /usr/local/lib/python3.12/dist-packages/pywpsrpc
 COPY --from=builder /tmp/libexitfix.so /tmp/libmqsim2.so /opt/wpsrpc-fix/
-COPY convert_docx2pdf.py entrypoint.sh http_server.py /opt/wpsrpc-rpc/
+COPY convert_docx2pdf.py entrypoint.sh http_server.py rpcengine.py worker.py /opt/wpsrpc-rpc/
 COPY tests/e2e_test.sh /opt/wpsrpc-rpc/tests/e2e_test.sh
 COPY tests/fixtures/route.pptx /opt/wpsrpc-rpc/tests/fixtures/route.pptx
 RUN chmod +x /opt/wpsrpc-rpc/entrypoint.sh /opt/wpsrpc-rpc/tests/e2e_test.sh

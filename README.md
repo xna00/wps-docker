@@ -29,8 +29,9 @@ docker run --rm -v "$PWD":/data xna00/wps2pdf
 ### 方式二：HTTP API（常驻服务）
 
 ```bash
-# 启动（端口默认 8080）
-docker run -d --name wps-api -p 8080:8080 -e MODE=api xna00/wps2pdf
+# 启动（端口默认 8080）。建议加 --init：tini 作 PID 1 回收 worker 强杀后
+# 残留的 WPS 孤儿/僵尸进程，避免长期运行 PID 槽被耗尽
+docker run -d --init --name wps-api -p 8080:8080 -e MODE=api xna00/wps2pdf
 
 # 健康检查
 curl http://localhost:8080/health
@@ -40,11 +41,17 @@ curl http://localhost:8080/health
 curl -o output.pdf -F "file=@input.docx" http://localhost:8080/convert
 
 # 可选环境变量
-#   PORT=8080       监听端口
-#   MAX_FILE_MB=50  上传大小上限（默认 50MB）
+#   PORT=8080         监听端口
+#   MAX_FILE_MB=50    上传大小上限（默认 50MB）
+#   MAX_WORKERS=3     全局并发 worker 上限（0=不限制；按内存预算调，每 worker ≈0.4GB）
+#   QUEUE_TIMEOUT=60  池满排队超时秒（超时返回 503）
+#   TASK_TIMEOUT=180  转换超时秒（兜底 WPS 挂死）
 ```
 
-> 说明：服务懒初始化 WPS 实例，首次请求约 0.3s，之后**每个请求约 0.13s**（实测 10/10 成功、内存稳定，常驻单例 + 崩溃自动重建）。
+> 说明（v1.7.0）：**并发 worker 池**架构——请求动态创建 WPS worker（每实例独立进程，可并行），
+> 用完保留 1 个 idle 备用，冷启动跨进程文件锁串行化，请求级超时强杀 + 进程级挂死隔离。
+> 实测：小文件并发与旧版持平（~10 QPS），大文件并发快 2~3.4 倍；已知挂死格式
+> odp/ods/uop 入口 415 直接拒绝；池满排队超时返回 503。内存 ≈ MAX_WORKERS×0.4GB。
 > **仅限内网使用，无鉴权**（如需公网暴露请自行加网关鉴权）。
 
 ## 构建
